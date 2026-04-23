@@ -3,7 +3,23 @@
 //! This crate is the future home of orchestration logic that should remain
 //! independent from transport (HTTP/SSE) and presentation (TUI/Web).
 
+pub mod models;
+pub mod orchestrator;
+pub mod ports;
+
 use nocturne_domain::{PlaybackState, PlaybackStatus};
+
+pub use models::{
+    BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreId,
+    CoreSnapshot, CoreTimestamp, PlaybackPositionUpdatedEvent, PlaybackStateChangedEvent,
+    PlaybackTrackChangedEvent, QueueUpdateReason, QueueUpdatedEvent, SearchJobCompletedEvent,
+    SearchJobFailedEvent, SearchJobRecord, SearchJobStatus, SearchResultsRecord,
+    SystemErrorEvent, SystemErrorSeverity,
+};
+pub use orchestrator::{CoreError, Orchestrator};
+pub use ports::{
+    ClockPort, EventPublisherPort, IdGeneratorPort, IdKind, PlaybackPort, PortError, SearchPort,
+};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct NocturneCore;
