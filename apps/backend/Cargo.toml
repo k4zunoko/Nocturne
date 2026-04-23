@@ -1,0 +1,14 @@
+[package]
+name = "nocturne-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nocturne-api = { path = "../../crates/api" }
+nocturne-core = { path = "../../crates/core" }
+nocturne-domain = { path = "../../crates/domain" }
+nocturne-infrastructure = { path = "../../crates/infrastructure" }
+
+[lints]
+workspace = true
