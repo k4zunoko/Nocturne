@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 nocturne-domain = { path = "../domain" }
 serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
