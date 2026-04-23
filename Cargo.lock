@@ -51,6 +51,7 @@ dependencies = [
 name = "nocturne-infrastructure"
 version = "0.1.0"
 dependencies = [
+ "nocturne-core",
  "nocturne-domain",
 ]
 
