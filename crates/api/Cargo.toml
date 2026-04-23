@@ -1,0 +1,12 @@
+[package]
+name = "nocturne-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nocturne-domain = { path = "../domain" }
+serde.workspace = true
+
+[lints]
+workspace = true
