@@ -301,6 +301,7 @@ version = "0.1.0"
 dependencies = [
  "nocturne-core",
  "nocturne-domain",
+ "serde_json",
  "tokio",
 ]
 
