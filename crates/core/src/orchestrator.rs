@@ -315,16 +315,14 @@ where
             .ok_or_else(|| CoreError::not_found("queue_item", queue_item_id))?;
         let removed_current = self.state.playback.current_queue_item_id.as_deref() == Some(queue_item_id);
 
-        self.state.queue.remove(removed_index);
-
         if removed_current {
-            self.playback.stop()?;
-            self.state.playback.state = PlaybackStatus::Stopped;
-            self.state.playback.position_ms = 0;
-            self.state.playback.current_queue_item_id = None;
-            self.normalize_queue_for_stop();
-            self.publish_playback_state_changed()?;
+            return Err(CoreError::conflict(
+                "current_queue_item_not_removable",
+                "cannot remove the currently playing queue item",
+            ));
         }
+
+        self.state.queue.remove(removed_index);
 
         self.publish_queue_updated(QueueUpdateReason::Remove)?;
         self.command_accepted(None, None)
@@ -851,6 +849,30 @@ mod tests {
         assert_eq!(snapshot.search_jobs.len(), 1);
         assert_eq!(snapshot.playback.state, PlaybackStatus::Stopped);
         assert_eq!(snapshot.queue[0].status, QueueItemStatus::Queued);
+    }
+
+    #[test]
+    fn removing_current_queue_item_is_rejected() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.enqueue_song(song("song_1")).unwrap();
+        orchestrator.play().unwrap();
+
+        let error = orchestrator.remove_queue_item("queue_item_0001").unwrap_err();
+
+        match error {
+            CoreError::Conflict { code, message } => {
+                assert_eq!(code, "current_queue_item_not_removable");
+                assert_eq!(message, "cannot remove the currently playing queue item");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     struct FailingPlayback;

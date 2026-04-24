@@ -15,9 +15,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use nocturne_api::{
-    ApiVersion, BackendStatus, CommandAccepted, EventEnvelope, EventName, HealthResponse,
-    PlaybackPositionUpdated, PlaybackStateChanged, PlaybackTrackChanged, ProblemDetails,
-    QueueUpdateReason as ApiQueueUpdateReason, QueueUpdated, SearchCommandRequest,
+    ApiVersion, BackendStatus, CommandAccepted, EmptyPayload, EventEnvelope, EventName,
+    HealthResponse, PlaybackPositionUpdated, PlaybackSeekRequest, PlaybackStateChanged,
+    PlaybackTrackChanged, ProblemDetails, QueueAddRequest, QueueMoveRequest, QueueRemoveRequest,
+    QueueResponse, QueueUpdateReason as ApiQueueUpdateReason, QueueUpdated, SearchCommandRequest,
     SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus, SearchJobSummary,
     SearchResultsResponse, StateSnapshot, SystemError, SystemErrorSeverity,
 };
@@ -192,7 +193,20 @@ fn app_router(state: AppState) -> Router {
         .route(nocturne_api::HEALTH_PATH, get(health_handler))
         .route(nocturne_api::STATE_PATH, get(state_handler))
         .route(nocturne_api::EVENTS_PATH, get(events_handler))
+        .route("/api/v1/queue", get(queue_handler))
+        .route("/api/v1/playback", get(playback_handler))
         .route("/api/v1/commands/search", post(search_command_handler))
+        .route("/api/v1/commands/queue/add", post(queue_add_handler))
+        .route("/api/v1/commands/queue/remove", post(queue_remove_handler))
+        .route("/api/v1/commands/queue/move", post(queue_move_handler))
+        .route("/api/v1/commands/queue/clear", post(queue_clear_handler))
+        .route("/api/v1/commands/playback/play", post(playback_play_handler))
+        .route("/api/v1/commands/playback/pause", post(playback_pause_handler))
+        .route("/api/v1/commands/playback/play-pause", post(playback_play_pause_handler))
+        .route("/api/v1/commands/playback/stop", post(playback_stop_handler))
+        .route("/api/v1/commands/playback/next", post(playback_next_handler))
+        .route("/api/v1/commands/playback/previous", post(playback_previous_handler))
+        .route("/api/v1/commands/playback/seek", post(playback_seek_handler))
         .route(
             "/api/v1/search/results/{job_id}",
             get(search_results_handler),
@@ -296,6 +310,172 @@ async fn search_command_handler(
     ))
 }
 
+async fn queue_handler(State(state): State<AppState>) -> Json<QueueResponse> {
+    let orchestrator = state.orchestrator.lock().await;
+    Json(QueueResponse {
+        items: orchestrator.queue().to_vec(),
+    })
+}
+
+async fn playback_handler(State(state): State<AppState>) -> Json<nocturne_domain::PlaybackState> {
+    let orchestrator = state.orchestrator.lock().await;
+    Json(orchestrator.state().playback().clone())
+}
+
+async fn queue_add_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<QueueAddRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(request) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/queue/add"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .enqueue_song_by_id(&request.song_id)
+        .map_err(|error| map_core_error(error, "/api/v1/commands/queue/add"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn queue_remove_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<QueueRemoveRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(request) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/queue/remove"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .remove_queue_item(&request.queue_item_id)
+        .map_err(|error| map_core_error(error, "/api/v1/commands/queue/remove"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn queue_move_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<QueueMoveRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(request) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/queue/move"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .move_queue_item(&request.queue_item_id, request.to_index)
+        .map_err(|error| map_core_error(error, "/api/v1/commands/queue/move"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn queue_clear_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(_) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/queue/clear"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .clear_queue()
+        .map_err(|error| map_core_error(error, "/api/v1/commands/queue/clear"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_play_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(_) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/play"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .play()
+        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/play"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_pause_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(_) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/pause"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .pause()
+        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/pause"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_play_pause_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(_) = request
+        .map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/play-pause"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .play_pause()
+        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/play-pause"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_stop_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(_) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/stop"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .stop()
+        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/stop"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_next_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(_) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/next"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .next()
+        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/next"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_previous_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(_) = request
+        .map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/previous"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .previous()
+        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/previous"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_seek_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<PlaybackSeekRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(request) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/seek"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .seek(request.position_ms)
+        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/seek"))?;
+
+    Ok(command_accepted_response(receipt))
+}
+
 async fn search_results_handler(
     State(state): State<AppState>,
     Path(job_id): Path<String>,
@@ -329,6 +509,21 @@ fn map_sse_event(core: CoreEventEnvelope<CoreEvent>) -> Event {
         .id(envelope.event_id)
         .event(envelope.event)
         .data(payload)
+}
+
+fn command_accepted_response(
+    receipt: nocturne_core::CommandReceipt,
+) -> (StatusCode, Json<CommandAccepted>) {
+    (
+        StatusCode::ACCEPTED,
+        Json(CommandAccepted {
+            ok: true,
+            command_id: receipt.command_id,
+            accepted_at: Some(receipt.accepted_at),
+            job_id: receipt.job_id,
+            queue_item_id: receipt.queue_item_id,
+        }),
+    )
 }
 
 fn state_headers(last_event_id: Option<String>) -> HeaderMap {
@@ -625,6 +820,7 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
+    use nocturne_api::{PlaybackSeekRequest, QueueAddRequest, QueueMoveRequest, QueueRemoveRequest, QueueResponse};
     use nocturne_core::{
         CoreEventKind, EventPublisherPort, SystemErrorEvent, SystemErrorSeverity as CoreSeverity,
     };
@@ -1039,5 +1235,416 @@ mod tests {
             .iter()
             .any(|event| matches!(event.data, CoreEvent::SystemError(_)));
         assert!(has_system_error);
+    }
+
+    #[tokio::test]
+    async fn queue_add_endpoint_accepts_song_and_queue_endpoint_returns_item() {
+        let search_runtime = LocalSearchRuntime::default();
+        search_runtime.set_fixture(
+            "queue add fixture",
+            vec![Song {
+                id: String::from("youtube:queue-song"),
+                title: String::from("Queue Song"),
+                channel_name: String::from("Fixture Channel"),
+                duration_ms: 123_000,
+                source_url: String::from("https://www.youtube.com/watch?v=queue-song"),
+            }],
+        );
+
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(search_runtime.clone()),
+        )));
+
+        let job_id = {
+            let mut locked = orchestrator.lock().await;
+            locked.submit_search("queue add fixture").unwrap().job_id.unwrap()
+        };
+        process_pending_search_jobs(&orchestrator, &search_runtime).await;
+
+        let app = app_router(AppState {
+            orchestrator: orchestrator.clone(),
+            events: event_publisher,
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/queue/add")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&QueueAddRequest {
+                            song_id: String::from("youtube:queue-song"),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: CommandAccepted = serde_json::from_slice(&body).unwrap();
+        assert!(payload.ok);
+        assert!(payload.queue_item_id.is_some());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: QueueResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.items.len(), 1);
+        assert_eq!(payload.items[0].song.id, "youtube:queue-song");
+
+        let results = orchestrator.lock().await.search_results(&job_id).unwrap();
+        assert_eq!(results.results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queue_add_endpoint_rejects_unknown_fields() {
+        let app = app_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/queue/add")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"song_id":"song_1","extra":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.title, "request validation failed");
+        assert!(payload.detail.contains("unknown field"));
+    }
+
+    #[tokio::test]
+    async fn queue_remove_endpoint_rejects_current_item() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let mut orchestrator = Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+        let song = Song {
+            id: String::from("youtube:current-song"),
+            title: String::from("Current Song"),
+            channel_name: String::from("Fixture Channel"),
+            duration_ms: 123_000,
+            source_url: String::from("https://www.youtube.com/watch?v=current-song"),
+        };
+        let queue_item_id = orchestrator.enqueue_song(song).unwrap().queue_item_id.unwrap();
+        orchestrator.play().unwrap();
+
+        let app = app_router(AppState {
+            orchestrator: Arc::new(Mutex::new(orchestrator)),
+            events: event_publisher,
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/queue/remove")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&QueueRemoveRequest { queue_item_id }).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.r#type, "https://nocturne.local/problems/current_queue_item_not_removable");
+    }
+
+    #[tokio::test]
+    async fn queue_move_endpoint_reorders_items() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let mut orchestrator = Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+        orchestrator
+            .enqueue_song(Song {
+                id: String::from("song_a"),
+                title: String::from("Song A"),
+                channel_name: String::from("Channel A"),
+                duration_ms: 1000,
+                source_url: String::from("https://example.com/a"),
+            })
+            .unwrap();
+        let second_id = orchestrator
+            .enqueue_song(Song {
+                id: String::from("song_b"),
+                title: String::from("Song B"),
+                channel_name: String::from("Channel B"),
+                duration_ms: 2000,
+                source_url: String::from("https://example.com/b"),
+            })
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+
+        let app = app_router(AppState {
+            orchestrator: Arc::new(Mutex::new(orchestrator)),
+            events: event_publisher,
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/queue/move")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&QueueMoveRequest {
+                            queue_item_id: second_id,
+                            to_index: 0,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: QueueResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.items[0].song.id, "song_b");
+        assert_eq!(payload.items[1].song.id, "song_a");
+    }
+
+    #[tokio::test]
+    async fn queue_clear_endpoint_clears_queue() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let mut orchestrator = Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+        orchestrator
+            .enqueue_song(Song {
+                id: String::from("song_a"),
+                title: String::from("Song A"),
+                channel_name: String::from("Channel A"),
+                duration_ms: 1000,
+                source_url: String::from("https://example.com/a"),
+            })
+            .unwrap();
+
+        let app = app_router(AppState {
+            orchestrator: Arc::new(Mutex::new(orchestrator)),
+            events: event_publisher,
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/queue/clear")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: QueueResponse = serde_json::from_slice(&body).unwrap();
+        assert!(payload.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn playback_play_and_get_endpoint_return_current_state() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let mut orchestrator = Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+        orchestrator
+            .enqueue_song(Song {
+                id: String::from("song_a"),
+                title: String::from("Song A"),
+                channel_name: String::from("Channel A"),
+                duration_ms: 1000,
+                source_url: String::from("https://example.com/a"),
+            })
+            .unwrap();
+
+        let app = app_router(AppState {
+            orchestrator: Arc::new(Mutex::new(orchestrator)),
+            events: event_publisher,
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/playback/play")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/playback")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: nocturne_domain::PlaybackState = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.state, nocturne_domain::PlaybackStatus::Playing);
+        assert!(payload.current_queue_item_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn playback_seek_endpoint_updates_position() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let mut orchestrator = Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+        orchestrator
+            .enqueue_song(Song {
+                id: String::from("song_a"),
+                title: String::from("Song A"),
+                channel_name: String::from("Channel A"),
+                duration_ms: 1000,
+                source_url: String::from("https://example.com/a"),
+            })
+            .unwrap();
+        orchestrator.play().unwrap();
+
+        let app = app_router(AppState {
+            orchestrator: Arc::new(Mutex::new(orchestrator)),
+            events: event_publisher,
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/playback/seek")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&PlaybackSeekRequest { position_ms: 321 }).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/playback")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: nocturne_domain::PlaybackState = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.position_ms, 321);
+    }
+
+    #[tokio::test]
+    async fn playback_pause_endpoint_rejects_unknown_fields() {
+        let app = app_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/playback/pause")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"unexpected":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
+        assert!(payload.detail.contains("unknown field"));
     }
 }
