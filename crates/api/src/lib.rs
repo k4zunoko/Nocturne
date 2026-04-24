@@ -13,6 +13,8 @@ pub const API_V1_BASE_PATH: &str = "/api/v1";
 pub const HEALTH_PATH: &str = "/api/v1/health";
 pub const STATE_PATH: &str = "/api/v1/state";
 pub const EVENTS_PATH: &str = "/api/v1/events";
+pub const LAST_EVENT_ID_HEADER: &str = "last-event-id";
+pub const CURRENT_EVENT_ID_HEADER: &str = "x-nocturne-last-event-id";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApiVersion {
