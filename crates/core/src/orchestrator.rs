@@ -145,6 +145,11 @@ where
         &self.state
     }
 
+    #[must_use]
+    pub fn backend_state(&self) -> &BackendState {
+        &self.state.backend
+    }
+
     pub fn set_backend_ready(&mut self, ready: bool) {
         self.state.backend.ready = ready;
     }

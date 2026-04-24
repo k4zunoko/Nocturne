@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 pub use audio::{LocalPlaybackAdapter, LocalPlaybackSnapshot, PlaybackCommand, SharedPlaybackState};
 pub use clock::LocalClock;
-pub use events::{LocalEventLog, LocalEventPublisher};
+pub use events::{BroadcastEventPublisher, EventCursorError, LocalEventLog, LocalEventPublisher};
 pub use ids::LocalIdGenerator;
 pub use search::{
     LocalSearchAdapter, LocalSearchFailure, LocalSearchRuntime, PendingSearchJob,
