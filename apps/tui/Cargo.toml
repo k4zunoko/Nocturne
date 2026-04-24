@@ -5,9 +5,20 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+crossterm = { version = "0.28", features = ["event-stream"] }
+eventsource-stream = "0.2"
+futures-util = "0.3"
 nocturne-api = { path = "../../crates/api" }
 nocturne-core = { path = "../../crates/core" }
 nocturne-domain = { path = "../../crates/domain" }
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
 
 [lints]
 workspace = true
