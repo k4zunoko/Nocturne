@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+tokio.workspace = true
 nocturne-core = { path = "../core" }
 nocturne-domain = { path = "../domain" }
 

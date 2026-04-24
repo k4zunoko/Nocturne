@@ -16,8 +16,12 @@ edition = "2024"
 rust-version = "1.85"
 
 [workspace.dependencies]
+axum = { version = "0.8", features = ["json", "tokio", "http1"] }
+async-stream = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net", "time"] }
+tower = { version = "0.5", features = ["util"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
