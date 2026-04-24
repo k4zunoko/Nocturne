@@ -108,6 +108,7 @@ pub struct ProblemDetails {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SearchCommandRequest {
     pub query: String,
 }

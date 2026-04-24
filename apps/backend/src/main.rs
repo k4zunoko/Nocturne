@@ -1,35 +1,37 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::collections::HashSet;
+use std::time::Duration;
 
 use async_stream::stream;
-use axum::extract::State;
-use axum::http::{HeaderMap, HeaderName, HeaderValue};
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{Json as ExtractJson, Path, State};
 use axum::http::StatusCode;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use nocturne_api::{
-    ApiVersion, BackendStatus, EventEnvelope, EventName, HealthResponse, PlaybackPositionUpdated,
-    ProblemDetails,
-    PlaybackStateChanged, PlaybackTrackChanged, QueueUpdateReason as ApiQueueUpdateReason,
-    QueueUpdated, SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus,
-    SearchJobSummary, StateSnapshot, SystemError, SystemErrorSeverity,
+    ApiVersion, BackendStatus, CommandAccepted, EventEnvelope, EventName, HealthResponse,
+    PlaybackPositionUpdated, PlaybackStateChanged, PlaybackTrackChanged, ProblemDetails,
+    QueueUpdateReason as ApiQueueUpdateReason, QueueUpdated, SearchCommandRequest,
+    SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus, SearchJobSummary,
+    SearchResultsResponse, StateSnapshot, SystemError, SystemErrorSeverity,
 };
 use nocturne_core::{
-    CoreEvent, CoreEventEnvelope, CoreSnapshot, NocturneCore, Orchestrator,
+    CoreError, CoreEvent, CoreEventEnvelope, CoreSnapshot, NocturneCore, Orchestrator,
     QueueUpdateReason as CoreQueueUpdateReason, SearchJobRecord,
     SearchJobStatus as CoreSearchJobStatus, SystemErrorSeverity as CoreSystemErrorSeverity,
 };
-use serde_json::Value;
 use nocturne_infrastructure::{
     BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalClock, LocalEventLog,
     LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter, LocalSearchRuntime,
     SharedPlaybackState,
 };
+use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
@@ -42,7 +44,8 @@ type BackendOrchestrator = Orchestrator<
     LocalSearchAdapter,
 >;
 
-const CURRENT_EVENT_ID_HEADER: HeaderName = HeaderName::from_static(nocturne_api::CURRENT_EVENT_ID_HEADER);
+const CURRENT_EVENT_ID_HEADER: HeaderName =
+    HeaderName::from_static(nocturne_api::CURRENT_EVENT_ID_HEADER);
 
 #[derive(Clone)]
 struct AppState {
@@ -68,8 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     orchestrator.set_backend_version(Some(env!("CARGO_PKG_VERSION")));
 
     let snapshot = orchestrator.snapshot();
+    let orchestrator = Arc::new(Mutex::new(orchestrator));
+    spawn_search_worker(orchestrator.clone(), search_runtime.clone());
     let state = AppState {
-        orchestrator: Arc::new(Mutex::new(orchestrator)),
+        orchestrator,
         events: event_publisher.clone(),
     };
     let app = app_router(state.clone());
@@ -93,11 +98,105 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn spawn_search_worker(
+    orchestrator: Arc<Mutex<BackendOrchestrator>>,
+    search_runtime: LocalSearchRuntime,
+) {
+    tokio::spawn(async move {
+        loop {
+            let processed = process_pending_search_jobs(&orchestrator, &search_runtime).await;
+            let delay = if processed == 0 {
+                Duration::from_millis(100)
+            } else {
+                Duration::from_millis(10)
+            };
+            tokio::time::sleep(delay).await;
+        }
+    });
+}
+
+async fn process_pending_search_jobs(
+    orchestrator: &Arc<Mutex<BackendOrchestrator>>,
+    search_runtime: &LocalSearchRuntime,
+) -> usize {
+    let pending_jobs = search_runtime.drain_pending();
+
+    for job in &pending_jobs {
+        let runtime = search_runtime.clone();
+        let query = job.query.clone();
+        let result = tokio::task::spawn_blocking(move || runtime.resolve(&query)).await;
+
+        let mut orchestrator = orchestrator.lock().await;
+        match result {
+            Ok(Ok(results)) => {
+                if let Err(error) = orchestrator.complete_search(&job.job_id, results) {
+                    eprintln!("failed to complete search job {}: {error}", job.job_id);
+                }
+            }
+            Ok(Err(failure)) => {
+                let user_message = user_message_for_search_failure(&failure.code);
+                let should_emit_system_error = matches!(
+                    failure.code.as_str(),
+                    "yt_dlp_missing" | "yt_dlp_spawn_failed" | "yt_dlp_timeout"
+                );
+
+                if let Err(error) =
+                    orchestrator.fail_search(&job.job_id, &failure.code, user_message)
+                {
+                    eprintln!("failed to fail search job {}: {error}", job.job_id);
+                }
+
+                if should_emit_system_error
+                    && let Err(error) = orchestrator.emit_system_error(
+                        &failure.code,
+                        user_message,
+                        CoreSystemErrorSeverity::Error,
+                    )
+                {
+                    eprintln!("failed to emit system error for {}: {error}", job.job_id);
+                }
+            }
+            Err(error) => {
+                if let Err(report_error) = orchestrator.fail_search(
+                    &job.job_id,
+                    "search_worker_join_failed",
+                    error.to_string(),
+                ) {
+                    eprintln!(
+                        "failed to report search worker join error for {}: {report_error}",
+                        job.job_id
+                    );
+                }
+            }
+        }
+    }
+
+    pending_jobs.len()
+}
+
+fn user_message_for_search_failure(code: &str) -> &'static str {
+    match code {
+        "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
+        "yt_dlp_spawn_failed" => "The backend could not start the search provider.",
+        "yt_dlp_timeout" => "The search provider timed out.",
+        "yt_dlp_invalid_json" | "yt_dlp_invalid_response" => {
+            "The search provider returned unreadable results."
+        }
+        "yt_dlp_failed" => "Search provider failed to return results.",
+        _ => "Search failed on the backend.",
+    }
+}
+
 fn app_router(state: AppState) -> Router {
     Router::new()
         .route(nocturne_api::HEALTH_PATH, get(health_handler))
         .route(nocturne_api::STATE_PATH, get(state_handler))
         .route(nocturne_api::EVENTS_PATH, get(events_handler))
+        .route("/api/v1/commands/search", post(search_command_handler))
+        .route(
+            "/api/v1/search/results/{job_id}",
+            get(search_results_handler),
+        )
         .with_state(state)
 }
 
@@ -139,10 +238,7 @@ async fn state_handler(State(state): State<AppState>) -> impl axum::response::In
     (state_headers(last_event_id), Json(snapshot))
 }
 
-async fn events_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+async fn events_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let last_event_id = headers
         .get(nocturne_api::LAST_EVENT_ID_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -177,6 +273,54 @@ async fn events_handler(
     Ok::<_, (StatusCode, Json<ProblemDetails>)>(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
+async fn search_command_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<SearchCommandRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(request) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/search"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .submit_search(request.query)
+        .map_err(|error| map_core_error(error, "/api/v1/commands/search"))?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(CommandAccepted {
+            ok: true,
+            command_id: receipt.command_id,
+            accepted_at: Some(receipt.accepted_at),
+            job_id: receipt.job_id,
+            queue_item_id: receipt.queue_item_id,
+        }),
+    ))
+}
+
+async fn search_results_handler(
+    State(state): State<AppState>,
+    Path(job_id): Path<String>,
+) -> Result<Json<SearchResultsResponse>, (StatusCode, Json<ProblemDetails>)> {
+    let orchestrator = state.orchestrator.lock().await;
+    let record = orchestrator.search_results(&job_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ProblemDetails {
+                r#type: String::from("https://nocturne.local/problems/search-results-not-found"),
+                title: String::from("search results not found"),
+                status: StatusCode::NOT_FOUND.as_u16(),
+                detail: format!("No completed search results were found for job '{job_id}'."),
+                instance: Some(format!("/api/v1/search/results/{job_id}")),
+                errors: Vec::new(),
+            }),
+        )
+    })?;
+
+    Ok(Json(SearchResultsResponse {
+        job: map_search_job_summary(record.job),
+        results: record.results,
+    }))
+}
+
 fn map_sse_event(core: CoreEventEnvelope<CoreEvent>) -> Event {
     let envelope = map_event_envelope(core);
     let payload = serde_json::to_string(&envelope).expect("server event should serialize");
@@ -190,7 +334,8 @@ fn map_sse_event(core: CoreEventEnvelope<CoreEvent>) -> Event {
 fn state_headers(last_event_id: Option<String>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if let Some(last_event_id) = last_event_id {
-        let value = HeaderValue::from_str(&last_event_id).expect("event id should be a valid header value");
+        let value =
+            HeaderValue::from_str(&last_event_id).expect("event id should be a valid header value");
         headers.insert(CURRENT_EVENT_ID_HEADER, value);
     }
     headers
@@ -205,7 +350,11 @@ fn map_state_snapshot(snapshot: CoreSnapshot) -> StateSnapshot {
         playback: snapshot.playback,
         current_song: snapshot.current_song,
         queue: snapshot.queue,
-        search_jobs: snapshot.search_jobs.into_iter().map(map_search_job_summary).collect(),
+        search_jobs: snapshot
+            .search_jobs
+            .into_iter()
+            .map(map_search_job_summary)
+            .collect(),
         snapshot_id: snapshot.snapshot_id,
         timestamp: snapshot.timestamp,
     }
@@ -362,12 +511,124 @@ fn map_cursor_error(error: EventCursorError) -> (StatusCode, Json<ProblemDetails
     }
 }
 
+fn map_core_error(error: CoreError, instance: &str) -> (StatusCode, Json<ProblemDetails>) {
+    match error {
+        CoreError::Validation { code, message } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ProblemDetails {
+                r#type: format!("https://nocturne.local/problems/{code}"),
+                title: String::from("request validation failed"),
+                status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                detail: message,
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+        CoreError::NotFound { kind, id } => (
+            StatusCode::NOT_FOUND,
+            Json(ProblemDetails {
+                r#type: format!("https://nocturne.local/problems/{kind}-not-found"),
+                title: format!("{kind} not found"),
+                status: StatusCode::NOT_FOUND.as_u16(),
+                detail: format!("{kind} '{id}' was not found."),
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+        CoreError::Conflict { code, message } => (
+            StatusCode::CONFLICT,
+            Json(ProblemDetails {
+                r#type: format!("https://nocturne.local/problems/{code}"),
+                title: String::from("request conflict"),
+                status: StatusCode::CONFLICT.as_u16(),
+                detail: message,
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+        CoreError::Port { code, message } => (
+            StatusCode::BAD_GATEWAY,
+            Json(ProblemDetails {
+                r#type: format!("https://nocturne.local/problems/{code}"),
+                title: String::from("backend dependency failure"),
+                status: StatusCode::BAD_GATEWAY.as_u16(),
+                detail: message,
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+    }
+}
+
+fn map_json_rejection(error: JsonRejection, instance: &str) -> (StatusCode, Json<ProblemDetails>) {
+    match error {
+        JsonRejection::JsonSyntaxError(inner) => (
+            StatusCode::BAD_REQUEST,
+            Json(ProblemDetails {
+                r#type: String::from("https://nocturne.local/problems/malformed-json"),
+                title: String::from("malformed json request body"),
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                detail: inner.body_text(),
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+        JsonRejection::JsonDataError(inner) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ProblemDetails {
+                r#type: String::from("https://nocturne.local/problems/request-validation"),
+                title: String::from("request validation failed"),
+                status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                detail: inner.body_text(),
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+        JsonRejection::MissingJsonContentType(inner) => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(ProblemDetails {
+                r#type: String::from("https://nocturne.local/problems/unsupported-media-type"),
+                title: String::from("unsupported media type"),
+                status: StatusCode::UNSUPPORTED_MEDIA_TYPE.as_u16(),
+                detail: inner.body_text(),
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+        JsonRejection::BytesRejection(inner) => (
+            StatusCode::BAD_REQUEST,
+            Json(ProblemDetails {
+                r#type: String::from("https://nocturne.local/problems/request-body-read-failed"),
+                title: String::from("request body could not be read"),
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                detail: inner.body_text(),
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+        _ => (
+            StatusCode::BAD_REQUEST,
+            Json(ProblemDetails {
+                r#type: String::from("https://nocturne.local/problems/invalid-json-request"),
+                title: String::from("invalid json request body"),
+                status: StatusCode::BAD_REQUEST.as_u16(),
+                detail: error.body_text(),
+                instance: Some(String::from(instance)),
+                errors: Vec::new(),
+            }),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::{to_bytes, Body};
+    use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use nocturne_core::{CoreEventKind, EventPublisherPort, SystemErrorEvent, SystemErrorSeverity as CoreSeverity};
+    use nocturne_core::{
+        CoreEventKind, EventPublisherPort, SystemErrorEvent, SystemErrorSeverity as CoreSeverity,
+    };
+    use nocturne_domain::Song;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -392,7 +653,12 @@ mod tests {
         let app = app_router(test_state());
 
         let response = app
-            .oneshot(Request::builder().uri(nocturne_api::HEALTH_PATH).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(nocturne_api::HEALTH_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -409,7 +675,12 @@ mod tests {
         let app = app_router(test_state());
 
         let response = app
-            .oneshot(Request::builder().uri(nocturne_api::STATE_PATH).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(nocturne_api::STATE_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -481,7 +752,12 @@ mod tests {
         });
 
         let response = app
-            .oneshot(Request::builder().uri(nocturne_api::STATE_PATH).body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri(nocturne_api::STATE_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -537,5 +813,231 @@ mod tests {
         let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.status, StatusCode::CONFLICT.as_u16());
         assert!(payload.detail.contains("Refresh state"));
+    }
+
+    #[tokio::test]
+    async fn pending_search_jobs_are_completed_by_worker_helper() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let search_runtime = LocalSearchRuntime::default();
+        search_runtime.set_fixture(
+            "worker fixture",
+            vec![Song {
+                id: String::from("youtube:test-song"),
+                title: String::from("Worker Fixture Song"),
+                channel_name: String::from("Fixture Channel"),
+                duration_ms: 123_000,
+                source_url: String::from("https://www.youtube.com/watch?v=test-song"),
+            }],
+        );
+
+        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher,
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(search_runtime.clone()),
+        )));
+
+        let job_id = {
+            let mut locked = orchestrator.lock().await;
+            locked
+                .submit_search("worker fixture")
+                .unwrap()
+                .job_id
+                .unwrap()
+        };
+
+        let processed = process_pending_search_jobs(&orchestrator, &search_runtime).await;
+        assert_eq!(processed, 1);
+
+        let locked = orchestrator.lock().await;
+        let results = locked.search_results(&job_id).unwrap();
+        assert_eq!(results.job.status, CoreSearchJobStatus::Completed);
+        assert_eq!(results.results.len(), 1);
+        assert_eq!(results.results[0].title, "Worker Fixture Song");
+    }
+
+    #[tokio::test]
+    async fn search_command_endpoint_accepts_job() {
+        let app = app_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"utada traveling"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: CommandAccepted = serde_json::from_slice(&body).unwrap();
+        assert!(payload.ok);
+        assert!(payload.job_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn search_command_endpoint_rejects_unknown_fields_with_problem_details() {
+        let app = app_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"utada traveling","limit":5}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.title, "request validation failed");
+        assert!(payload.detail.contains("unknown field"));
+    }
+
+    #[tokio::test]
+    async fn search_command_endpoint_rejects_malformed_json_with_problem_details() {
+        let app = app_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"utada traveling""#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.title, "malformed json request body");
+        assert!(payload.detail.contains("Failed to parse"));
+    }
+
+    #[tokio::test]
+    async fn search_command_endpoint_rejects_empty_query_with_problem_details() {
+        let app = app_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"query":"   "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.title, "request validation failed");
+        assert_eq!(
+            payload.r#type,
+            "https://nocturne.local/problems/query_empty"
+        );
+        assert!(payload.detail.contains("search query must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn search_results_endpoint_returns_completed_results() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let search_runtime = LocalSearchRuntime::default();
+        search_runtime.set_fixture(
+            "endpoint fixture",
+            vec![Song {
+                id: String::from("youtube:endpoint-song"),
+                title: String::from("Endpoint Fixture Song"),
+                channel_name: String::from("Fixture Channel"),
+                duration_ms: 210_000,
+                source_url: String::from("https://www.youtube.com/watch?v=endpoint-song"),
+            }],
+        );
+        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(search_runtime.clone()),
+        )));
+        let state = AppState {
+            orchestrator: orchestrator.clone(),
+            events: event_publisher,
+        };
+
+        let job_id = {
+            let mut locked = orchestrator.lock().await;
+            locked
+                .submit_search("endpoint fixture")
+                .unwrap()
+                .job_id
+                .unwrap()
+        };
+        process_pending_search_jobs(&orchestrator, &search_runtime).await;
+
+        let app = app_router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/search/results/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: SearchResultsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.job.job_id, job_id);
+        assert_eq!(payload.results.len(), 1);
+        assert_eq!(payload.results[0].title, "Endpoint Fixture Song");
+    }
+
+    #[tokio::test]
+    async fn worker_emits_system_error_for_missing_yt_dlp() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 8);
+        let search_runtime = LocalSearchRuntime::default();
+        search_runtime.set_failure(
+            "missing provider",
+            "yt_dlp_missing",
+            "hidden internal detail",
+        );
+        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(search_runtime.clone()),
+        )));
+
+        {
+            let mut locked = orchestrator.lock().await;
+            locked.submit_search("missing provider").unwrap();
+        }
+        process_pending_search_jobs(&orchestrator, &search_runtime).await;
+
+        let snapshot = event_log.snapshot();
+        let has_system_error = snapshot
+            .iter()
+            .any(|event| matches!(event.data, CoreEvent::SystemError(_)));
+        assert!(has_system_error);
     }
 }
