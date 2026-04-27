@@ -27,6 +27,7 @@ use nocturne_core::{
     QueueUpdateReason as CoreQueueUpdateReason, SearchJobRecord,
     SearchJobStatus as CoreSearchJobStatus, SystemErrorSeverity as CoreSystemErrorSeverity,
 };
+use nocturne_domain::PlaybackStatus;
 use nocturne_infrastructure::{
     BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalClock, LocalEventLog,
     LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter, LocalSearchRuntime,
@@ -74,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = orchestrator.snapshot();
     let orchestrator = Arc::new(Mutex::new(orchestrator));
     spawn_search_worker(orchestrator.clone(), search_runtime.clone());
+    spawn_playback_monitor(orchestrator.clone(), playback_state.clone());
     let state = AppState {
         orchestrator,
         events: event_publisher.clone(),
@@ -112,6 +114,63 @@ fn spawn_search_worker(
                 Duration::from_millis(10)
             };
             tokio::time::sleep(delay).await;
+        }
+    });
+}
+
+fn spawn_playback_monitor(
+    orchestrator: Arc<Mutex<BackendOrchestrator>>,
+    playback_state: SharedPlaybackState,
+) {
+    tokio::spawn(async move {
+        let mut last_position = None;
+        let mut last_finished_queue_item_id = None;
+
+        loop {
+            let snapshot = playback_state.snapshot();
+            let current_queue_item_id = snapshot.current_item.as_ref().map(|item| item.id.clone());
+
+            if current_queue_item_id.is_none() {
+                last_position = None;
+                last_finished_queue_item_id = None;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+
+            if let Some(finished_queue_item_id) = snapshot.finished_queue_item_id.clone() {
+                if last_finished_queue_item_id.as_deref() != Some(finished_queue_item_id.as_str()) {
+                    let mut orchestrator = orchestrator.lock().await;
+                    if orchestrator.state().playback().current_queue_item_id.as_deref()
+                        == Some(finished_queue_item_id.as_str())
+                        && let Err(error) = orchestrator.finish_current_track()
+                    {
+                        eprintln!(
+                            "failed to advance playback after natural track end {}: {error}",
+                            finished_queue_item_id
+                        );
+                    }
+                    last_finished_queue_item_id = Some(finished_queue_item_id);
+                    last_position = None;
+                }
+            } else if !snapshot.paused && Some(snapshot.position_ms) != last_position {
+                let mut orchestrator = orchestrator.lock().await;
+                if orchestrator.state().playback().state == PlaybackStatus::Playing
+                    && orchestrator.state().playback().current_queue_item_id.as_deref()
+                        == current_queue_item_id.as_deref()
+                {
+                    if let Err(error) = orchestrator.note_position(snapshot.position_ms) {
+                        eprintln!(
+                            "failed to publish playback position {}ms for {:?}: {error}",
+                            snapshot.position_ms,
+                            current_queue_item_id
+                        );
+                    } else {
+                        last_position = Some(snapshot.position_ms);
+                    }
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
 }
@@ -185,6 +244,40 @@ fn user_message_for_search_failure(code: &str) -> &'static str {
         }
         "yt_dlp_failed" => "Search provider failed to return results.",
         _ => "Search failed on the backend.",
+    }
+}
+
+fn user_message_for_playback_failure(code: &str) -> &'static str {
+    match code {
+        "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
+        "yt_dlp_spawn_failed" => "The backend could not start yt-dlp for playback.",
+        "yt_dlp_timeout" => "The backend timed out while preparing audio playback.",
+        "audio_output_unavailable" => "Audio output is unavailable on the backend.",
+        "audio_source_resolve_failed"
+        | "playback_stream_open_failed"
+        | "playback_decode_failed" => "The backend could not load audio for playback.",
+        "playback_seek_failed" => "The backend could not seek the current playback stream.",
+        "playback_url_invalid" | "playback_runtime_failed" => {
+            "The backend could not prepare playback."
+        }
+        "playback_worker_unavailable" => {
+            "The backend playback worker is unavailable."
+        }
+        _ => "Playback failed on the backend.",
+    }
+}
+
+fn report_playback_command_error(orchestrator: &mut BackendOrchestrator, error: &CoreError) {
+    let CoreError::Port { code, .. } = error else {
+        return;
+    };
+
+    if let Err(report_error) = orchestrator.emit_system_error(
+        code.clone(),
+        user_message_for_playback_failure(code),
+        CoreSystemErrorSeverity::Error,
+    ) {
+        eprintln!("failed to emit playback system error for {code}: {report_error}");
     }
 }
 
@@ -385,9 +478,10 @@ async fn playback_play_handler(
     let ExtractJson(_) =
         request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/play"))?;
     let mut orchestrator = state.orchestrator.lock().await;
-    let receipt = orchestrator
-        .play()
-        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/play"))?;
+    let receipt = orchestrator.play().map_err(|error| {
+        report_playback_command_error(&mut orchestrator, &error);
+        map_core_error(error, "/api/v1/commands/playback/play")
+    })?;
 
     Ok(command_accepted_response(receipt))
 }
@@ -399,9 +493,10 @@ async fn playback_pause_handler(
     let ExtractJson(_) =
         request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/pause"))?;
     let mut orchestrator = state.orchestrator.lock().await;
-    let receipt = orchestrator
-        .pause()
-        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/pause"))?;
+    let receipt = orchestrator.pause().map_err(|error| {
+        report_playback_command_error(&mut orchestrator, &error);
+        map_core_error(error, "/api/v1/commands/playback/pause")
+    })?;
 
     Ok(command_accepted_response(receipt))
 }
@@ -413,9 +508,10 @@ async fn playback_play_pause_handler(
     let ExtractJson(_) = request
         .map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/play-pause"))?;
     let mut orchestrator = state.orchestrator.lock().await;
-    let receipt = orchestrator
-        .play_pause()
-        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/play-pause"))?;
+    let receipt = orchestrator.play_pause().map_err(|error| {
+        report_playback_command_error(&mut orchestrator, &error);
+        map_core_error(error, "/api/v1/commands/playback/play-pause")
+    })?;
 
     Ok(command_accepted_response(receipt))
 }
@@ -427,9 +523,10 @@ async fn playback_stop_handler(
     let ExtractJson(_) =
         request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/stop"))?;
     let mut orchestrator = state.orchestrator.lock().await;
-    let receipt = orchestrator
-        .stop()
-        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/stop"))?;
+    let receipt = orchestrator.stop().map_err(|error| {
+        report_playback_command_error(&mut orchestrator, &error);
+        map_core_error(error, "/api/v1/commands/playback/stop")
+    })?;
 
     Ok(command_accepted_response(receipt))
 }
@@ -441,9 +538,10 @@ async fn playback_next_handler(
     let ExtractJson(_) =
         request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/next"))?;
     let mut orchestrator = state.orchestrator.lock().await;
-    let receipt = orchestrator
-        .next()
-        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/next"))?;
+    let receipt = orchestrator.next().map_err(|error| {
+        report_playback_command_error(&mut orchestrator, &error);
+        map_core_error(error, "/api/v1/commands/playback/next")
+    })?;
 
     Ok(command_accepted_response(receipt))
 }
@@ -455,9 +553,10 @@ async fn playback_previous_handler(
     let ExtractJson(_) = request
         .map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/previous"))?;
     let mut orchestrator = state.orchestrator.lock().await;
-    let receipt = orchestrator
-        .previous()
-        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/previous"))?;
+    let receipt = orchestrator.previous().map_err(|error| {
+        report_playback_command_error(&mut orchestrator, &error);
+        map_core_error(error, "/api/v1/commands/playback/previous")
+    })?;
 
     Ok(command_accepted_response(receipt))
 }
@@ -469,9 +568,10 @@ async fn playback_seek_handler(
     let ExtractJson(request) =
         request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/seek"))?;
     let mut orchestrator = state.orchestrator.lock().await;
-    let receipt = orchestrator
-        .seek(request.position_ms)
-        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/seek"))?;
+    let receipt = orchestrator.seek(request.position_ms).map_err(|error| {
+        report_playback_command_error(&mut orchestrator, &error);
+        map_core_error(error, "/api/v1/commands/playback/seek")
+    })?;
 
     Ok(command_accepted_response(receipt))
 }
@@ -1235,6 +1335,40 @@ mod tests {
             .iter()
             .any(|event| matches!(event.data, CoreEvent::SystemError(_)));
         assert!(has_system_error);
+    }
+
+    #[test]
+    fn playback_port_errors_emit_user_visible_system_errors() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 8);
+        let mut orchestrator = Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher,
+            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+
+        report_playback_command_error(
+            &mut orchestrator,
+            &CoreError::Port {
+                code: String::from("audio_output_unavailable"),
+                message: String::from("hidden detail"),
+            },
+        );
+
+        let snapshot = event_log.snapshot();
+        let system_error = snapshot
+            .iter()
+            .find_map(|event| match &event.data {
+                CoreEvent::SystemError(system_error) => Some(system_error),
+                _ => None,
+            })
+            .expect("expected a system.error event");
+
+        assert_eq!(system_error.code, "audio_output_unavailable");
+        assert_eq!(system_error.message, "Audio output is unavailable on the backend.");
+        assert_eq!(system_error.severity, CoreSeverity::Error);
     }
 
     #[tokio::test]
