@@ -9,6 +9,8 @@ tokio.workspace = true
 serde_json.workspace = true
 nocturne-core = { path = "../core" }
 nocturne-domain = { path = "../domain" }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-all"] }
+stream-download = { version = "0.24", features = ["process"] }
 
 [lints]
 workspace = true
