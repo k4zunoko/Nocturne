@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nocturne_api::{BackendStatus, StateSnapshot};
+use nocturne_api::{BackendStatus, SearchJobSummary, SearchJobStatus, StateSnapshot};
 use nocturne_domain::{PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, Song};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
@@ -10,14 +10,20 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use crate::backend::{BackendEvent, BackendEventKind, CommandAction, SnapshotSeed};
+use crate::backend::{
+    BackendEvent, BackendEventKind, CommandAction, CommandOutcome, SearchResultsOutcome,
+    SnapshotSeed,
+};
+
+const MAX_SEARCH_RESULTS: usize = 5;
 
 #[derive(Debug)]
 pub enum AppEvent {
     Input(KeyEvent),
     Backend(BackendEvent),
     Snapshot(SnapshotSeed),
-    CommandResult(Result<String, String>),
+    CommandResult(Result<CommandOutcome, String>),
+    SearchResults(SearchResultsOutcome),
     ConnectionStatus(String),
 }
 
@@ -25,6 +31,39 @@ pub enum AppEvent {
 enum Overlay {
     None,
     Queue,
+    Search,
+    Help,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchOverlayState {
+    Loading,
+    Results,
+    Empty,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchOverlay {
+    job_id: String,
+    query: String,
+    state: SearchOverlayState,
+    results: Vec<Song>,
+    selected: usize,
+    error_message: Option<String>,
+    closed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PendingSearchTerminalState {
+    Completed(Vec<Song>),
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputState {
+    text: String,
+    cursor: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +86,14 @@ pub struct App {
     playback: PlaybackState,
     current_song: Option<Song>,
     queue: Vec<QueueItem>,
+    search_jobs: Vec<SearchJobSummary>,
     overlay: Overlay,
     queue_selection: usize,
     pending_delete_confirmation: bool,
+    input: InputState,
+    search_overlay: Option<SearchOverlay>,
+    pending_search_terminal: Option<(String, PendingSearchTerminalState)>,
+    pending_search_results_request: Option<String>,
     status_message: String,
     status_level: StatusLevel,
     last_event_id: Option<String>,
@@ -73,9 +117,14 @@ impl App {
             },
             current_song: None,
             queue: Vec::new(),
+            search_jobs: Vec::new(),
             overlay: Overlay::None,
             queue_selection: 0,
             pending_delete_confirmation: false,
+            input: InputState::default(),
+            search_overlay: None,
+            pending_search_terminal: None,
+            pending_search_results_request: None,
             status_message: String::from("Starting backend..."),
             status_level: StatusLevel::Info,
             last_event_id: None,
@@ -90,6 +139,7 @@ impl App {
         self.playback = snapshot.playback;
         self.current_song = snapshot.current_song;
         self.queue = snapshot.queue;
+        self.search_jobs = snapshot.search_jobs;
         self.last_event_id = current_event_id;
         self.sync_playback_anchor(self.playback.position_ms);
         self.sync_current_song_from_queue();
@@ -98,6 +148,7 @@ impl App {
             StatusLevel::Info,
             format!("Connected to backend on http://{}", self.backend_addr),
         );
+        self.reconcile_search_overlay_from_jobs();
     }
 
     pub fn apply_backend_event(&mut self, event: BackendEvent) {
@@ -125,6 +176,24 @@ impl App {
                 self.sync_current_song_from_queue();
                 self.reconcile_queue_selection();
             }
+            BackendEventKind::SearchJobStarted(job) => {
+                self.upsert_search_job(job.clone());
+                self.apply_search_job_started(job);
+            }
+            BackendEventKind::SearchJobCompleted(payload) => {
+                self.upsert_search_job(payload.job.clone());
+                self.apply_search_job_completed(payload.job.job_id, payload.results);
+            }
+            BackendEventKind::SearchJobFailed(payload) => {
+                if let Some(job) = self
+                    .search_jobs
+                    .iter_mut()
+                    .find(|job| job.job_id == payload.job_id)
+                {
+                    job.status = SearchJobStatus::Failed;
+                }
+                self.apply_search_job_failed(payload.job_id, payload.message);
+            }
             BackendEventKind::SystemError(payload) => {
                 let level = match payload.severity {
                     nocturne_api::SystemErrorSeverity::Warning => StatusLevel::Warning,
@@ -135,15 +204,42 @@ impl App {
         }
     }
 
-    pub fn apply_command_result(&mut self, result: Result<String, String>) {
+    pub fn apply_command_result(&mut self, result: Result<CommandOutcome, String>) {
         match result {
-            Ok(message) => self.set_status(StatusLevel::Info, message),
+            Ok(CommandOutcome::StatusMessage(message)) => self.set_status(StatusLevel::Info, message),
+            Ok(CommandOutcome::SearchSubmitted { job_id, query }) => {
+                self.open_search_overlay(job_id, query);
+                self.apply_pending_terminal_state();
+                self.reconcile_search_overlay_from_jobs();
+                if self.search_overlay_state() == Some(SearchOverlayState::Loading) {
+                    self.set_status(StatusLevel::Info, String::from("Searching backend..."));
+                }
+            }
+            Ok(CommandOutcome::SongQueued(message)) => {
+                self.overlay = Overlay::None;
+                self.search_overlay = None;
+                self.input.clear();
+                self.set_status(StatusLevel::Info, message);
+            }
             Err(message) => self.set_status(StatusLevel::Error, message),
         }
     }
 
     pub fn note_connection_status(&mut self, message: String) {
         self.set_status(StatusLevel::Warning, message);
+    }
+
+    pub fn apply_search_results(&mut self, outcome: SearchResultsOutcome) {
+        self.pending_search_results_request = None;
+        match outcome {
+            SearchResultsOutcome::Loaded { job, results } => {
+                self.upsert_search_job(job.clone());
+                self.apply_search_job_completed(job.job_id, results);
+            }
+            SearchResultsOutcome::Failed { job_id, message } => {
+                self.apply_search_job_failed(job_id, message);
+            }
+        }
     }
 
     pub fn tick(&mut self) {
@@ -165,9 +261,16 @@ impl App {
             }
         }
 
+        if matches!(key.code, KeyCode::F(1)) {
+            self.toggle_help_overlay();
+            return AppAction::None;
+        }
+
         match self.overlay {
-            Overlay::None => AppAction::None,
+            Overlay::None => self.handle_input_key(key),
             Overlay::Queue => self.handle_queue_overlay_key(key),
+            Overlay::Search => self.handle_search_overlay_key(key),
+            Overlay::Help => self.handle_help_overlay_key(key),
         }
     }
 
@@ -177,6 +280,7 @@ impl App {
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(6),
+                Constraint::Length(4),
                 Constraint::Min(6),
                 Constraint::Length(3),
                 Constraint::Length(2),
@@ -184,17 +288,60 @@ impl App {
             .split(area);
 
         frame.render_widget(self.now_playing_widget(), layout[0]);
-        frame.render_widget(self.queue_summary_widget(), layout[1]);
-        frame.render_widget(self.status_widget(), layout[2]);
-        frame.render_widget(self.shortcuts_widget(), layout[3]);
+        frame.render_widget(self.search_input_widget(), layout[1]);
+        frame.render_widget(self.queue_summary_widget(), layout[2]);
+        frame.render_widget(self.status_widget(), layout[3]);
+        frame.render_widget(self.shortcuts_widget(), layout[4]);
 
-        if self.overlay == Overlay::Queue {
-            self.render_queue_overlay(frame, area);
+        match self.overlay {
+            Overlay::None => {}
+            Overlay::Queue => self.render_queue_overlay(frame, area),
+            Overlay::Search => self.render_search_overlay(frame, area),
+            Overlay::Help => self.render_help_overlay(frame, area),
         }
     }
 
     pub fn last_event_id(&self) -> Option<String> {
         self.last_event_id.clone()
+    }
+
+    pub fn take_search_results_request(&mut self) -> Option<String> {
+        self.pending_search_results_request.take()
+    }
+
+    fn handle_input_key(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Enter => self.submit_input(),
+            KeyCode::Backspace => {
+                self.input.delete_before_cursor();
+                AppAction::None
+            }
+            KeyCode::Delete => {
+                self.input.delete_at_cursor();
+                AppAction::None
+            }
+            KeyCode::Left => {
+                self.input.move_left();
+                AppAction::None
+            }
+            KeyCode::Right => {
+                self.input.move_right();
+                AppAction::None
+            }
+            KeyCode::Home => {
+                self.input.move_home();
+                AppAction::None
+            }
+            KeyCode::End => {
+                self.input.move_end();
+                AppAction::None
+            }
+            KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+                self.input.insert(ch);
+                AppAction::None
+            }
+            _ => AppAction::None,
+        }
     }
 
     fn handle_queue_overlay_key(&mut self, key: KeyEvent) -> AppAction {
@@ -245,10 +392,96 @@ impl App {
         }
     }
 
+    fn handle_search_overlay_key(&mut self, key: KeyEvent) -> AppAction {
+        let Some(search) = self.search_overlay.as_mut() else {
+            self.overlay = Overlay::None;
+            return AppAction::None;
+        };
+
+        match search.state {
+            SearchOverlayState::Loading => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    search.closed = true;
+                    self.overlay = Overlay::None;
+                    AppAction::None
+                }
+                _ => AppAction::None,
+            },
+            SearchOverlayState::Results => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    search.closed = true;
+                    self.overlay = Overlay::None;
+                    AppAction::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    search.move_selection(-1);
+                    AppAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    search.move_selection(1);
+                    AppAction::None
+                }
+                KeyCode::Enter => search
+                    .selected_song()
+                    .map(|song| AppAction::Command(CommandAction::AddSong(song.id.clone())))
+                    .unwrap_or(AppAction::None),
+                _ => AppAction::None,
+            },
+            SearchOverlayState::Empty | SearchOverlayState::Error => match key.code {
+                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') => {
+                    search.closed = true;
+                    self.overlay = Overlay::None;
+                    self.input.clear();
+                    AppAction::None
+                }
+                _ => AppAction::None,
+            },
+        }
+    }
+
+    fn handle_help_overlay_key(&mut self, key: KeyEvent) -> AppAction {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(1) => {
+                self.overlay = Overlay::None;
+                AppAction::None
+            }
+            _ => AppAction::None,
+        }
+    }
+
     fn open_queue_overlay(&mut self) {
+        self.dismiss_search_overlay();
         self.overlay = Overlay::Queue;
         self.pending_delete_confirmation = false;
         self.queue_selection = self.initial_queue_selection();
+    }
+
+    fn open_search_overlay(&mut self, job_id: String, query: String) {
+        self.search_overlay = Some(SearchOverlay {
+            job_id,
+            query,
+            state: SearchOverlayState::Loading,
+            results: Vec::new(),
+            selected: 0,
+            error_message: None,
+            closed: false,
+        });
+        self.overlay = Overlay::Search;
+    }
+
+    fn search_overlay_state(&self) -> Option<SearchOverlayState> {
+        self.search_overlay.as_ref().map(|search| search.state.clone())
+    }
+
+    fn toggle_help_overlay(&mut self) {
+        if self.overlay != Overlay::Help {
+            self.dismiss_search_overlay();
+        }
+        self.overlay = if self.overlay == Overlay::Help {
+            Overlay::None
+        } else {
+            Overlay::Help
+        };
     }
 
     fn initial_queue_selection(&self) -> usize {
@@ -306,6 +539,177 @@ impl App {
         });
     }
 
+    fn submit_input(&mut self) -> AppAction {
+        let text = self.input.text.trim().to_owned();
+        if text.is_empty() {
+            self.set_status(StatusLevel::Warning, String::from("Enter a search query first."));
+            return AppAction::None;
+        }
+
+        if let Some(command) = text.strip_prefix('/') {
+            return self.handle_slash_command(command.trim());
+        }
+
+        AppAction::Command(CommandAction::Search(text))
+    }
+
+    fn handle_slash_command(&mut self, command: &str) -> AppAction {
+        match command {
+            "exit" => AppAction::Quit,
+            "help" => {
+                self.overlay = Overlay::Help;
+                AppAction::None
+            }
+            _ => {
+                self.set_status(
+                    StatusLevel::Warning,
+                    String::from("Unknown slash command. Try /help or /exit."),
+                );
+                AppAction::None
+            }
+        }
+    }
+
+    fn upsert_search_job(&mut self, job: SearchJobSummary) {
+        if let Some(existing) = self
+            .search_jobs
+            .iter_mut()
+            .find(|existing| existing.job_id == job.job_id)
+        {
+            *existing = job;
+        } else {
+            self.search_jobs.push(job);
+        }
+    }
+
+    fn apply_search_job_started(&mut self, job: SearchJobSummary) {
+        if let Some(search) = self.search_overlay.as_mut()
+            && search.job_id == job.job_id
+            && !search.closed
+        {
+            search.state = SearchOverlayState::Loading;
+            search.error_message = None;
+        }
+    }
+
+    fn apply_search_job_completed(&mut self, job_id: String, results: Vec<Song>) {
+        if let Some(search) = self.search_overlay.as_mut()
+            && search.job_id == job_id
+        {
+            if search.closed {
+                return;
+            }
+            search.results = results.into_iter().take(MAX_SEARCH_RESULTS).collect();
+            search.selected = 0;
+            search.error_message = None;
+            search.state = if search.results.is_empty() {
+                SearchOverlayState::Empty
+            } else {
+                SearchOverlayState::Results
+            };
+            self.overlay = Overlay::Search;
+            self.pending_search_terminal = None;
+            self.pending_search_results_request = None;
+            let status_message = if search.results.is_empty() {
+                String::from("No matches found.")
+            } else {
+                format!("Found {} candidate(s).", search.results.len())
+            };
+            let _ = search;
+            self.set_status(StatusLevel::Info, status_message);
+        } else {
+            self.pending_search_terminal = Some((job_id, PendingSearchTerminalState::Completed(results)));
+        }
+    }
+
+    fn apply_search_job_failed(&mut self, job_id: String, message: String) {
+        if let Some(search) = self.search_overlay.as_mut()
+            && search.job_id == job_id
+        {
+            if search.closed {
+                return;
+            }
+            search.results.clear();
+            search.error_message = Some(message.clone());
+            search.state = SearchOverlayState::Error;
+            self.overlay = Overlay::Search;
+            self.pending_search_terminal = None;
+            self.pending_search_results_request = None;
+            self.set_status(StatusLevel::Error, message);
+        } else {
+            self.pending_search_terminal = Some((
+                job_id,
+                PendingSearchTerminalState::Failed(message),
+            ));
+        }
+    }
+
+    fn dismiss_search_overlay(&mut self) {
+        if let Some(search) = self.search_overlay.as_mut() {
+            search.closed = true;
+        }
+    }
+
+    fn apply_pending_terminal_state(&mut self) {
+        let Some((job_id, state)) = self.pending_search_terminal.clone() else {
+            return;
+        };
+
+        let Some(search) = self.search_overlay.as_ref() else {
+            return;
+        };
+
+        if search.job_id != job_id || search.closed {
+            return;
+        }
+
+        match state {
+            PendingSearchTerminalState::Completed(results) => {
+                self.apply_search_job_completed(job_id, results);
+            }
+            PendingSearchTerminalState::Failed(message) => {
+                self.apply_search_job_failed(job_id, message);
+            }
+        }
+    }
+
+    fn reconcile_search_overlay_from_jobs(&mut self) {
+        let Some(search) = self.search_overlay.as_ref() else {
+            return;
+        };
+
+        if search.closed {
+            return;
+        }
+
+        let Some(job) = self
+            .search_jobs
+            .iter()
+            .find(|job| job.job_id == search.job_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        match job.status {
+            SearchJobStatus::Completed => {
+                if matches!(self.search_overlay_state(), Some(SearchOverlayState::Loading)) {
+                    self.pending_search_results_request = Some(job.job_id);
+                    self.set_status(StatusLevel::Info, String::from("Refreshing search results..."));
+                }
+            }
+            SearchJobStatus::Failed => {
+                self.apply_search_job_failed(
+                    job.job_id,
+                    String::from("Search failed. Reconnect completed without a detailed error."),
+                );
+            }
+            SearchJobStatus::Queued | SearchJobStatus::Running => {
+                self.apply_pending_terminal_state();
+            }
+        }
+    }
+
     fn sync_playback_anchor(&mut self, position_ms: u64) {
         self.playback_anchor_ms = position_ms;
         self.display_position_ms = position_ms;
@@ -360,6 +764,30 @@ impl App {
             .wrap(Wrap { trim: true })
     }
 
+    fn search_input_widget(&self) -> Paragraph<'static> {
+        let (before_cursor, after_cursor) = self.input.split_for_render();
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Query ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(before_cursor, Style::default().fg(Color::White)),
+            Span::styled("▏", Style::default().fg(Color::Rgb(132, 146, 166))),
+            Span::styled(after_cursor, Style::default().fg(Color::White)),
+        ])];
+
+        if self.current_song.is_none() && self.queue.is_empty() {
+            lines.push(Line::from(
+                "Summon a song by name, artist, or a few remembered words.",
+            ));
+        } else {
+            lines.push(Line::from(
+                "Enter searches • /help shows commands • results open in the center overlay",
+            ));
+        }
+
+        Paragraph::new(lines)
+            .block(Block::default().title("Search").borders(Borders::ALL))
+            .wrap(Wrap { trim: true })
+    }
+
     fn queue_summary_widget(&self) -> Paragraph<'static> {
         let mut lines = Vec::new();
         if self.queue.is_empty() {
@@ -407,7 +835,7 @@ impl App {
 
     fn shortcuts_widget(&self) -> Paragraph<'static> {
         Paragraph::new(Line::from(
-            "Ctrl+P play/pause  Ctrl+Left previous  Ctrl+Right next  Ctrl+Q queue  Ctrl+C quit",
+            "Enter search  Ctrl+P play/pause  Ctrl+Left previous  Ctrl+Right next  Ctrl+Q queue  F1 help  /exit quit",
         ))
         .style(Style::default().fg(Color::DarkGray))
     }
@@ -459,6 +887,147 @@ impl App {
         );
     }
 
+    fn render_search_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        let Some(search) = self.search_overlay.as_ref() else {
+            return;
+        };
+
+        let overlay_area = centered_rect(72, 72, area);
+        frame.render_widget(Clear, overlay_area);
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(6), Constraint::Length(2)])
+            .split(overlay_area);
+
+        let header = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Search ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(search.query.clone()),
+            ]),
+            Line::from(match search.state {
+                SearchOverlayState::Loading => "Looking up candidates on the backend...",
+                SearchOverlayState::Results => "Choose one song to add to the queue.",
+                SearchOverlayState::Empty => "No matches found for this query.",
+                SearchOverlayState::Error => "Search failed before results became available.",
+            }),
+        ])
+        .block(Block::default().title("Search Results").borders(Borders::ALL))
+        .wrap(Wrap { trim: true });
+        frame.render_widget(header, layout[0]);
+
+        match search.state {
+            SearchOverlayState::Loading => {
+                frame.render_widget(
+                    Paragraph::new("Searching… you can close this overlay, and late results will stay hidden.")
+                        .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
+                        .wrap(Wrap { trim: true }),
+                    layout[1],
+                );
+            }
+            SearchOverlayState::Results => {
+                let items = search
+                    .results
+                    .iter()
+                    .enumerate()
+                    .map(|(index, song)| {
+                        let is_selected = index == search.selected;
+                        let mut lines = vec![Line::from(vec![
+                            Span::styled(
+                                song.title.clone(),
+                                if is_selected {
+                                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                                } else {
+                                    Style::default().fg(Color::White)
+                                },
+                            ),
+                        ])];
+                        if is_selected {
+                            lines.push(Line::from(vec![
+                                Span::styled(song.channel_name.clone(), Style::default().fg(Color::Gray)),
+                                Span::raw(" • "),
+                                Span::styled(
+                                    format_duration(song.duration_ms),
+                                    Style::default().fg(Color::Gray),
+                                ),
+                            ]));
+                        }
+                        ListItem::new(lines)
+                    })
+                    .collect::<Vec<_>>();
+
+                let list = List::new(items)
+                    .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
+                    .highlight_style(
+                        Style::default()
+                            .bg(Color::Rgb(28, 36, 48))
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("› ");
+
+                let mut state = ListState::default();
+                state.select(Some(search.selected));
+                frame.render_stateful_widget(list, layout[1], &mut state);
+            }
+            SearchOverlayState::Empty => {
+                frame.render_widget(
+                    Paragraph::new("Try a more specific song title, artist, or lyric fragment.")
+                        .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
+                        .wrap(Wrap { trim: true }),
+                    layout[1],
+                );
+            }
+            SearchOverlayState::Error => {
+                frame.render_widget(
+                    Paragraph::new(search.error_message.clone().unwrap_or_else(|| String::from("Search failed.")))
+                        .style(Style::default().fg(Color::LightRed))
+                        .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
+                        .wrap(Wrap { trim: true }),
+                    layout[1],
+                );
+            }
+        }
+
+        let footer = match search.state {
+            SearchOverlayState::Loading => "Esc or q closes • backend search keeps running",
+            SearchOverlayState::Results => "↑↓ / j k move • Enter adds to queue • Esc or q closes",
+            SearchOverlayState::Empty | SearchOverlayState::Error => {
+                "Enter, Esc, or q closes • query clears on close"
+            }
+        };
+        frame.render_widget(
+            Paragraph::new(footer)
+                .block(Block::default().borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM))
+                .wrap(Wrap { trim: true }),
+            layout[2],
+        );
+    }
+
+    fn render_help_overlay(&self, frame: &mut Frame<'_>, area: Rect) {
+        let overlay_area = centered_rect(64, 56, area);
+        frame.render_widget(Clear, overlay_area);
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::from("Search"),
+                Line::from("  Enter runs the current query"),
+                Line::from("  /help opens this overlay"),
+                Line::from("  /exit closes the TUI"),
+                Line::from(""),
+                Line::from("Playback"),
+                Line::from("  Ctrl+P play / pause"),
+                Line::from("  Ctrl+Left / Ctrl+Right previous / next"),
+                Line::from(""),
+                Line::from("Overlays"),
+                Line::from("  Ctrl+Q queue"),
+                Line::from("  F1 toggles help"),
+                Line::from("  Esc or q closes the active overlay"),
+            ])
+            .block(Block::default().title("Help").borders(Borders::ALL))
+            .wrap(Wrap { trim: true }),
+            overlay_area,
+        );
+    }
+
     fn format_queue_row(&self, item: &QueueItem, selected: bool) -> Line<'static> {
         let marker = if self.is_current_item(&item.id) {
             "▶"
@@ -496,6 +1065,97 @@ impl App {
     fn set_status(&mut self, level: StatusLevel, message: String) {
         self.status_level = level;
         self.status_message = message;
+    }
+}
+
+impl Default for InputState {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            cursor: 0,
+        }
+    }
+}
+
+impl InputState {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    fn insert(&mut self, ch: char) {
+        let byte_index = self.cursor_byte_index();
+        self.text.insert(byte_index, ch);
+        self.cursor += 1;
+    }
+
+    fn delete_before_cursor(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        let byte_index = self.cursor_byte_index();
+        self.text.remove(byte_index);
+    }
+
+    fn delete_at_cursor(&mut self) {
+        if self.cursor >= self.len_chars() {
+            return;
+        }
+        let byte_index = self.cursor_byte_index();
+        self.text.remove(byte_index);
+    }
+
+    fn move_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn move_right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.len_chars());
+    }
+
+    fn move_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn move_end(&mut self) {
+        self.cursor = self.len_chars();
+    }
+
+    fn split_for_render(&self) -> (String, String) {
+        let byte_index = self.cursor_byte_index();
+        (
+            self.text[..byte_index].to_owned(),
+            self.text[byte_index..].to_owned(),
+        )
+    }
+
+    fn len_chars(&self) -> usize {
+        self.text.chars().count()
+    }
+
+    fn cursor_byte_index(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(index, _)| index)
+            .unwrap_or(self.text.len())
+    }
+}
+
+impl SearchOverlay {
+    fn move_selection(&mut self, delta: isize) {
+        if self.results.is_empty() {
+            self.selected = 0;
+            return;
+        }
+
+        let max_index = self.results.len() as isize - 1;
+        self.selected = (self.selected as isize + delta).clamp(0, max_index) as usize;
+    }
+
+    fn selected_song(&self) -> Option<&Song> {
+        self.results.get(self.selected)
     }
 }
 
@@ -589,5 +1249,205 @@ mod tests {
         app.reconcile_queue_selection();
 
         assert_eq!(app.queue_selection, 1);
+    }
+
+    #[test]
+    fn search_submit_opens_loading_overlay() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.input.text = String::from("utada traveling");
+        app.input.move_end();
+
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(
+            action,
+            AppAction::Command(CommandAction::Search(String::from("utada traveling")))
+        );
+
+        app.apply_command_result(Ok(CommandOutcome::SearchSubmitted {
+            job_id: String::from("job_1"),
+            query: String::from("utada traveling"),
+        }));
+
+        assert_eq!(app.overlay, Overlay::Search);
+        let search = app.search_overlay.as_ref().unwrap();
+        assert_eq!(search.state, SearchOverlayState::Loading);
+        assert_eq!(search.query, "utada traveling");
+    }
+
+    #[test]
+    fn completed_search_shows_results_and_enter_queues_selected_song() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
+
+        app.apply_search_job_completed(String::from("job_1"), vec![song("song_1"), song("song_2")]);
+
+        assert_eq!(app.overlay, Overlay::Search);
+        let search = app.search_overlay.as_ref().unwrap();
+        assert_eq!(search.state, SearchOverlayState::Results);
+        assert_eq!(search.results.len(), 2);
+
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            action,
+            AppAction::Command(CommandAction::AddSong(String::from("song_1")))
+        );
+    }
+
+    #[test]
+    fn completed_search_caps_visible_results_to_five_items() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
+
+        app.apply_search_job_completed(
+            String::from("job_1"),
+            vec![
+                song("song_1"),
+                song("song_2"),
+                song("song_3"),
+                song("song_4"),
+                song("song_5"),
+                song("song_6"),
+            ],
+        );
+
+        let search = app.search_overlay.as_ref().unwrap();
+        assert_eq!(search.results.len(), MAX_SEARCH_RESULTS);
+        assert_eq!(search.results.last().map(|song| song.id.as_str()), Some("song_5"));
+    }
+
+    #[test]
+    fn completed_search_arriving_before_command_ack_is_applied_after_overlay_opens() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+
+        app.apply_search_job_completed(String::from("job_1"), vec![song("song_1")]);
+        app.apply_command_result(Ok(CommandOutcome::SearchSubmitted {
+            job_id: String::from("job_1"),
+            query: String::from("utada traveling"),
+        }));
+
+        let search = app.search_overlay.as_ref().unwrap();
+        assert_eq!(search.state, SearchOverlayState::Results);
+        assert_eq!(search.results.len(), 1);
+        assert_eq!(app.status_message, "Found 1 candidate(s).");
+    }
+
+    #[test]
+    fn failed_search_arriving_before_command_ack_is_applied_after_overlay_opens() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+
+        app.apply_search_job_failed(String::from("job_1"), String::from("yt-dlp failed"));
+        app.apply_command_result(Ok(CommandOutcome::SearchSubmitted {
+            job_id: String::from("job_1"),
+            query: String::from("utada traveling"),
+        }));
+
+        let search = app.search_overlay.as_ref().unwrap();
+        assert_eq!(search.state, SearchOverlayState::Error);
+        assert_eq!(search.error_message.as_deref(), Some("yt-dlp failed"));
+    }
+
+    #[test]
+    fn snapshot_marks_active_overlay_failed_when_job_failed_during_reconnect() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
+
+        app.apply_snapshot(
+            StateSnapshot {
+                backend: BackendStatus {
+                    ready: true,
+                    version: Some(String::from("test")),
+                },
+                playback: PlaybackState {
+                    state: PlaybackStatus::Stopped,
+                    position_ms: 0,
+                    current_queue_item_id: None,
+                },
+                current_song: None,
+                queue: Vec::new(),
+                search_jobs: vec![SearchJobSummary {
+                    job_id: String::from("job_1"),
+                    status: SearchJobStatus::Failed,
+                    query: String::from("utada traveling"),
+                    created_at: String::from("2026-04-24T00:00:00Z"),
+                    completed_at: Some(String::from("2026-04-24T00:00:05Z")),
+                    result_count: None,
+                }],
+                snapshot_id: String::from("snap_1"),
+                timestamp: String::from("2026-04-24T00:00:06Z"),
+            },
+            Some(String::from("evt_1")),
+        );
+
+        let search = app.search_overlay.as_ref().unwrap();
+        assert_eq!(search.state, SearchOverlayState::Error);
+        assert_eq!(
+            search.error_message.as_deref(),
+            Some("Search failed. Reconnect completed without a detailed error.")
+        );
+    }
+
+    #[test]
+    fn snapshot_requests_result_recovery_when_job_completed_during_reconnect() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
+
+        app.apply_snapshot(
+            StateSnapshot {
+                backend: BackendStatus {
+                    ready: true,
+                    version: Some(String::from("test")),
+                },
+                playback: PlaybackState {
+                    state: PlaybackStatus::Stopped,
+                    position_ms: 0,
+                    current_queue_item_id: None,
+                },
+                current_song: None,
+                queue: Vec::new(),
+                search_jobs: vec![SearchJobSummary {
+                    job_id: String::from("job_1"),
+                    status: SearchJobStatus::Completed,
+                    query: String::from("utada traveling"),
+                    created_at: String::from("2026-04-24T00:00:00Z"),
+                    completed_at: Some(String::from("2026-04-24T00:00:05Z")),
+                    result_count: Some(2),
+                }],
+                snapshot_id: String::from("snap_1"),
+                timestamp: String::from("2026-04-24T00:00:06Z"),
+            },
+            Some(String::from("evt_1")),
+        );
+
+        assert_eq!(app.take_search_results_request().as_deref(), Some("job_1"));
+        assert_eq!(app.status_message, "Refreshing search results...");
+    }
+
+    #[test]
+    fn closed_search_does_not_reopen_when_results_arrive_late() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.open_search_overlay(String::from("job_1"), String::from("late result"));
+
+        let _ = app.handle_key(KeyEvent::from(KeyCode::Esc));
+        app.apply_search_job_completed(String::from("job_1"), vec![song("song_1")]);
+
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.search_overlay.as_ref().unwrap().closed);
+    }
+
+    #[test]
+    fn adding_song_clears_query_and_closes_search_overlay() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.input.text = String::from("utada traveling");
+        app.input.move_end();
+        app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
+
+        app.apply_command_result(Ok(CommandOutcome::SongQueued(String::from(
+            "Added selection to queue.",
+        ))));
+
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.search_overlay.is_none());
+        assert!(app.input.text.is_empty());
     }
 }

@@ -5,7 +5,9 @@ use std::io;
 use std::time::Duration;
 
 use app::{App, AppAction, AppEvent};
-use backend::{BackendClient, ManagedBackend, spawn_command_task, spawn_sse_task};
+use backend::{
+    BackendClient, ManagedBackend, spawn_command_task, spawn_search_results_task, spawn_sse_task,
+};
 use crossterm::event::{Event, EventStream};
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
@@ -73,8 +75,19 @@ async fn run_app(
                         }
                     }
                     AppEvent::Backend(event) => app.apply_backend_event(event),
-                    AppEvent::Snapshot(seed) => app.apply_snapshot(seed.snapshot, seed.current_event_id),
-                    AppEvent::CommandResult(result) => app.apply_command_result(result),
+                    AppEvent::Snapshot(seed) => {
+                        app.apply_snapshot(seed.snapshot, seed.current_event_id);
+                        if let Some(job_id) = app.take_search_results_request() {
+                            spawn_search_results_task(client.clone(), job_id, tx.clone());
+                        }
+                    }
+                    AppEvent::CommandResult(result) => {
+                        app.apply_command_result(result);
+                        if let Some(job_id) = app.take_search_results_request() {
+                            spawn_search_results_task(client.clone(), job_id, tx.clone());
+                        }
+                    }
+                    AppEvent::SearchResults(result) => app.apply_search_results(result),
                     AppEvent::ConnectionStatus(message) => app.note_connection_status(message),
                 }
             }

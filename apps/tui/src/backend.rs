@@ -10,9 +10,10 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use nocturne_api::{
     CommandAccepted, EmptyPayload, EventEnvelope, PlaybackPositionUpdated, PlaybackStateChanged,
-    PlaybackTrackChanged, ProblemDetails, QueueRemoveRequest, QueueUpdated, StateSnapshot,
-    SystemError, CURRENT_EVENT_ID_HEADER, EVENTS_PATH, HEALTH_PATH, LAST_EVENT_ID_HEADER,
-    STATE_PATH,
+    PlaybackTrackChanged, ProblemDetails, QueueAddRequest, QueueRemoveRequest, QueueUpdated,
+    SearchCommandRequest, SearchJobCompleted, SearchJobFailed, SearchJobSummary,
+    SearchResultsResponse, StateSnapshot, SystemError, CURRENT_EVENT_ID_HEADER, EVENTS_PATH,
+    HEALTH_PATH, LAST_EVENT_ID_HEADER, STATE_PATH,
 };
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
@@ -26,10 +27,31 @@ const EVENT_CURSOR_NOT_FOUND_TYPE: &str =
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandAction {
+    Search(String),
+    AddSong(String),
     PlayPause,
     Next,
     Previous,
     RemoveQueueItem(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandOutcome {
+    StatusMessage(String),
+    SearchSubmitted { job_id: String, query: String },
+    SongQueued(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchResultsOutcome {
+    Loaded {
+        job: SearchJobSummary,
+        results: Vec<nocturne_domain::Song>,
+    },
+    Failed {
+        job_id: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +66,9 @@ pub enum BackendEventKind {
     PlaybackTrackChanged(PlaybackTrackChanged),
     PlaybackPositionUpdated(PlaybackPositionUpdated),
     QueueUpdated(QueueUpdated),
+    SearchJobStarted(SearchJobSummary),
+    SearchJobCompleted(SearchJobCompleted),
+    SearchJobFailed(SearchJobFailed),
     SystemError(SystemError),
 }
 
@@ -174,28 +199,89 @@ impl BackendClient {
         })
     }
 
-    pub async fn send_command(&self, action: CommandAction) -> Result<String, String> {
+    pub async fn send_command(&self, action: CommandAction) -> Result<CommandOutcome, String> {
         match action {
+            CommandAction::Search(query) => self
+                .post_json("/api/v1/commands/search", &SearchCommandRequest {
+                    query: query.clone(),
+                })
+                .await
+                .and_then(|accepted| {
+                    accepted
+                        .job_id
+                        .map(|job_id| CommandOutcome::SearchSubmitted { job_id, query })
+                        .ok_or_else(|| {
+                            String::from(
+                                "search command was accepted but no job id was returned",
+                            )
+                        })
+                }),
+            CommandAction::AddSong(song_id) => self
+                .post_json("/api/v1/commands/queue/add", &QueueAddRequest { song_id })
+                .await
+                .map(|_| CommandOutcome::SongQueued(String::from("Added selection to queue."))),
             CommandAction::PlayPause => {
                 self.post_json("/api/v1/commands/playback/play-pause", &EmptyPayload::default())
                     .await
-                    .map(|_| String::from("Playback toggle accepted."))
+                    .map(|_| CommandOutcome::StatusMessage(String::from("Playback toggle accepted.")))
             }
             CommandAction::Next => self
                 .post_json("/api/v1/commands/playback/next", &EmptyPayload::default())
                 .await
-                .map(|_| String::from("Skip to next track accepted.")),
+                .map(|_| CommandOutcome::StatusMessage(String::from("Skip to next track accepted."))),
             CommandAction::Previous => self
                 .post_json("/api/v1/commands/playback/previous", &EmptyPayload::default())
                 .await
-                .map(|_| String::from("Return to previous track accepted.")),
+                .map(|_| CommandOutcome::StatusMessage(String::from("Return to previous track accepted."))),
             CommandAction::RemoveQueueItem(queue_item_id) => self
                 .post_json(
                     "/api/v1/commands/queue/remove",
                     &QueueRemoveRequest { queue_item_id },
                 )
                 .await
-                .map(|_| String::from("Queue removal accepted.")),
+                .map(|_| CommandOutcome::StatusMessage(String::from("Queue removal accepted."))),
+        }
+    }
+
+    pub async fn fetch_search_results(&self, job_id: &str) -> SearchResultsOutcome {
+        let path = format!("/api/v1/search/results/{job_id}");
+        let response = match self.http.get(format!("{}{}", self.base_url, path)).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return SearchResultsOutcome::Failed {
+                    job_id: job_id.to_owned(),
+                    message: format!("request to {path} failed: {error}"),
+                };
+            }
+        };
+
+        if response.status().is_success() {
+            match response.json::<SearchResultsResponse>().await {
+                Ok(payload) => SearchResultsOutcome::Loaded {
+                    job: payload.job,
+                    results: payload.results,
+                },
+                Err(error) => SearchResultsOutcome::Failed {
+                    job_id: job_id.to_owned(),
+                    message: format!("search results response from {path} was invalid: {error}"),
+                },
+            }
+        } else {
+            let problem = match response.json::<ProblemDetails>().await {
+                Ok(problem) => problem,
+                Err(error) => {
+                    return SearchResultsOutcome::Failed {
+                        job_id: job_id.to_owned(),
+                        message: format!(
+                            "request to {path} failed with undecodable error: {error}"
+                        ),
+                    };
+                }
+            };
+            SearchResultsOutcome::Failed {
+                job_id: job_id.to_owned(),
+                message: problem.detail,
+            }
         }
     }
 
@@ -345,6 +431,17 @@ pub fn spawn_command_task(
     });
 }
 
+pub fn spawn_search_results_task(
+    client: BackendClient,
+    job_id: String,
+    tx: UnboundedSender<AppEvent>,
+) {
+    tokio::spawn(async move {
+        let result = client.fetch_search_results(&job_id).await;
+        let _ = tx.send(AppEvent::SearchResults(result));
+    });
+}
+
 fn decode_backend_event(envelope: EventEnvelope<Value>) -> Result<Option<BackendEvent>, TuiError> {
     let event_id = envelope.event_id;
     let kind = match envelope.event.as_str() {
@@ -366,6 +463,21 @@ fn decode_backend_event(envelope: EventEnvelope<Value>) -> Result<Option<Backend
         "queue.updated" => BackendEventKind::QueueUpdated(
             serde_json::from_value::<QueueUpdated>(envelope.data).map_err(|error| {
                 TuiError::new(format!("failed to decode queue.updated: {error}"))
+            })?,
+        ),
+        "search.job.started" => BackendEventKind::SearchJobStarted(
+            serde_json::from_value::<SearchJobSummary>(envelope.data).map_err(|error| {
+                TuiError::new(format!("failed to decode search.job.started: {error}"))
+            })?,
+        ),
+        "search.job.completed" => BackendEventKind::SearchJobCompleted(
+            serde_json::from_value::<SearchJobCompleted>(envelope.data).map_err(|error| {
+                TuiError::new(format!("failed to decode search.job.completed: {error}"))
+            })?,
+        ),
+        "search.job.failed" => BackendEventKind::SearchJobFailed(
+            serde_json::from_value::<SearchJobFailed>(envelope.data).map_err(|error| {
+                TuiError::new(format!("failed to decode search.job.failed: {error}"))
             })?,
         ),
         "system.error" => BackendEventKind::SystemError(
