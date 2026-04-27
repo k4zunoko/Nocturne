@@ -1295,6 +1295,35 @@ mod tests {
     }
 
     #[test]
+    fn completed_search_supports_jk_and_arrow_navigation() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
+
+        app.apply_search_job_completed(
+            String::from("job_1"),
+            vec![song("song_1"), song("song_2"), song("song_3")],
+        );
+
+        let _ = app.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.search_overlay.as_ref().unwrap().selected, 1);
+
+        let _ = app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.search_overlay.as_ref().unwrap().selected, 2);
+
+        let _ = app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(app.search_overlay.as_ref().unwrap().selected, 2);
+
+        let _ = app.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.search_overlay.as_ref().unwrap().selected, 1);
+
+        let _ = app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(app.search_overlay.as_ref().unwrap().selected, 0);
+
+        let _ = app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(app.search_overlay.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
     fn completed_search_caps_visible_results_to_five_items() {
         let mut app = App::new("127.0.0.1:4100".parse().unwrap());
         app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
@@ -1345,6 +1374,55 @@ mod tests {
         let search = app.search_overlay.as_ref().unwrap();
         assert_eq!(search.state, SearchOverlayState::Error);
         assert_eq!(search.error_message.as_deref(), Some("yt-dlp failed"));
+    }
+
+    #[test]
+    fn empty_search_closes_on_enter_esc_and_q_and_clears_query() {
+        for key in [
+            KeyEvent::from(KeyCode::Enter),
+            KeyEvent::from(KeyCode::Esc),
+            KeyEvent::from(KeyCode::Char('q')),
+        ] {
+            let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+            app.input.text = String::from("utada traveling");
+            app.input.move_end();
+            app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
+            app.apply_search_job_completed(String::from("job_1"), Vec::new());
+
+            let action = app.handle_key(key);
+
+            assert_eq!(action, AppAction::None);
+            assert_eq!(app.overlay, Overlay::None);
+            assert!(app.input.text.is_empty());
+            let search = app.search_overlay.as_ref().unwrap();
+            assert_eq!(search.state, SearchOverlayState::Empty);
+            assert!(search.closed);
+        }
+    }
+
+    #[test]
+    fn error_search_closes_on_enter_esc_and_q_and_clears_query() {
+        for key in [
+            KeyEvent::from(KeyCode::Enter),
+            KeyEvent::from(KeyCode::Esc),
+            KeyEvent::from(KeyCode::Char('q')),
+        ] {
+            let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+            app.input.text = String::from("utada traveling");
+            app.input.move_end();
+            app.open_search_overlay(String::from("job_1"), String::from("utada traveling"));
+            app.apply_search_job_failed(String::from("job_1"), String::from("yt-dlp failed"));
+
+            let action = app.handle_key(key);
+
+            assert_eq!(action, AppAction::None);
+            assert_eq!(app.overlay, Overlay::None);
+            assert!(app.input.text.is_empty());
+            let search = app.search_overlay.as_ref().unwrap();
+            assert_eq!(search.state, SearchOverlayState::Error);
+            assert_eq!(search.error_message.as_deref(), Some("yt-dlp failed"));
+            assert!(search.closed);
+        }
     }
 
     #[test]
