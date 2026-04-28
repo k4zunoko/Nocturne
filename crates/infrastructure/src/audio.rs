@@ -11,12 +11,15 @@ use nocturne_domain::QueueItem;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 
 use crate::recover_lock;
 
 const DEFAULT_YT_DLP_BINARY: &str = "yt-dlp";
 const DEFAULT_WINDOWS_YT_DLP_PATH: &str = r"C:\tools\yt-dlp\yt-dlp.exe";
 const YT_DLP_PATH_ENV: &str = "NOCTURNE_YT_DLP_PATH";
+const YT_DLP_AUDIO_FORMAT: &str =
+    "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
 const YT_DLP_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -160,6 +163,7 @@ enum ActivePlayback {
     Rodio {
         queue_item_id: String,
         _sink: MixerDeviceSink,
+        _runtime: Runtime,
         player: Player,
     },
 }
@@ -353,7 +357,8 @@ fn open_real_playback(item: &QueueItem, position_ms: u64) -> Result<ActivePlayba
     let player = Player::connect_new(sink.mixer());
 
     let playback_url = resolve_playback_url(&item.song.source_url)?;
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = RuntimeBuilder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .map_err(|error| {
@@ -403,6 +408,7 @@ fn open_real_playback(item: &QueueItem, position_ms: u64) -> Result<ActivePlayba
     Ok(ActivePlayback::Rodio {
         queue_item_id: item.id.clone(),
         _sink: sink,
+        _runtime: runtime,
         player,
     })
 }
@@ -419,7 +425,7 @@ fn resolve_youtube_playback_url(source_url: &str) -> Result<String, PortError> {
     let output = execute_yt_dlp([
         "--get-url",
         "--format",
-        "bestaudio/best",
+        YT_DLP_AUDIO_FORMAT,
         "--no-playlist",
         "--no-warnings",
         "--quiet",
@@ -671,5 +677,57 @@ mod tests {
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         ));
         assert!(is_real_playback_source("https://youtu.be/dQw4w9WgXcQ?t=43"));
+    }
+
+    #[test]
+    fn youtube_format_prefers_backend_decodable_audio() {
+        assert_eq!(
+            YT_DLP_AUDIO_FORMAT,
+            "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best"
+        );
+    }
+
+    #[test]
+    fn current_thread_runtime_drops_background_tasks_after_block_on_returns() {
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        runtime.block_on(async move {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let _ = tx.send(());
+            });
+        });
+
+        thread::sleep(Duration::from_millis(80));
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn multi_thread_runtime_keeps_background_tasks_alive_after_block_on_returns() {
+        let runtime = RuntimeBuilder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        let (tx, rx) = mpsc::channel();
+
+        let join = thread::spawn(move || {
+            handle.block_on(async move {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    let _ = tx.send(());
+                });
+            });
+        });
+
+        join.join().unwrap();
+
+        assert_eq!(rx.recv_timeout(Duration::from_millis(200)), Ok(()));
     }
 }
