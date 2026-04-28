@@ -1049,7 +1049,6 @@ impl App {
                 QueueItemStatus::Queued => "•",
                 QueueItemStatus::Loading => "…",
                 QueueItemStatus::Playing => "▶",
-                QueueItemStatus::Finished => "✓",
                 QueueItemStatus::Failed => "!",
             }
         };
@@ -1057,7 +1056,6 @@ impl App {
             QueueItemStatus::Queued => Style::default().fg(Color::White),
             QueueItemStatus::Loading => Style::default().fg(Color::Yellow),
             QueueItemStatus::Playing => Style::default().fg(Color::LightGreen),
-            QueueItemStatus::Finished => Style::default().fg(Color::DarkGray),
             QueueItemStatus::Failed => Style::default().fg(Color::LightRed),
         };
         if selected {

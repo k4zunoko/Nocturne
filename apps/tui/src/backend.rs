@@ -232,7 +232,7 @@ impl BackendClient {
             CommandAction::Previous => self
                 .post_json("/api/v1/commands/playback/previous", &EmptyPayload::default())
                 .await
-                .map(|_| CommandOutcome::StatusMessage(String::from("Return to previous track accepted."))),
+                .map(|_| CommandOutcome::StatusMessage(String::from("Restart current track accepted."))),
             CommandAction::RemoveQueueItem(queue_item_id) => self
                 .post_json(
                     "/api/v1/commands/queue/remove",

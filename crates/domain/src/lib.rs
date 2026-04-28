@@ -15,7 +15,6 @@ pub enum QueueItemStatus {
     Queued,
     Loading,
     Playing,
-    Finished,
     Failed,
 }
 

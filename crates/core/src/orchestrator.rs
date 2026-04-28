@@ -349,6 +349,22 @@ where
             ));
         }
 
+        if let Some(current_index) = self.current_index() {
+            if from_index == current_index {
+                return Err(CoreError::conflict(
+                    "current_queue_item_not_movable",
+                    "cannot move the currently playing queue item",
+                ));
+            }
+
+            if target_index <= current_index {
+                return Err(CoreError::conflict(
+                    "queue_move_before_current_not_allowed",
+                    "cannot move a queued item before the currently playing item",
+                ));
+            }
+        }
+
         let item = self.state.queue.remove(from_index);
         self.state.queue.insert(target_index, item);
 
@@ -441,22 +457,32 @@ where
     }
 
     pub fn next(&mut self) -> Result<CommandReceipt, CoreError> {
-        let next_index = match self.current_index() {
-            Some(current_index) if current_index + 1 < self.state.queue.len() => current_index + 1,
-            Some(_) => {
-                self.stop()?;
-                return self.command_accepted(None, None);
+        match self.current_index() {
+            Some(current_index) => {
+                self.state.queue.remove(current_index);
+
+                if self.state.queue.is_empty() {
+                    self.playback.stop()?;
+                    self.state.playback.state = PlaybackStatus::Stopped;
+                    self.state.playback.position_ms = 0;
+                    self.state.playback.current_queue_item_id = None;
+                    self.publish_playback_state_changed()?;
+                    self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+                } else {
+                    self.start_track(current_index.min(self.state.queue.len() - 1), 0)?;
+                }
             }
-            None if !self.state.queue.is_empty() => 0,
+            None if !self.state.queue.is_empty() => {
+                self.start_track(0, 0)?;
+            }
             None => {
                 return Err(CoreError::conflict(
                     "queue_empty",
                     "cannot skip forward without queued items",
                 ));
             }
-        };
+        }
 
-        self.start_track(next_index, 0)?;
         self.command_accepted(None, None)
     }
 
@@ -468,10 +494,7 @@ where
             ));
         }
 
-        let target_index = match self.current_index() {
-            Some(0) | None => 0,
-            Some(current_index) => current_index - 1,
-        };
+        let target_index = self.current_index().unwrap_or(0);
 
         self.start_track(target_index, 0)?;
         self.command_accepted(None, None)
@@ -505,20 +528,17 @@ where
             return Ok(());
         };
 
-        if let Some(item) = self.state.queue.get_mut(current_index) {
-            item.status = QueueItemStatus::Finished;
-        }
+        self.state.queue.remove(current_index);
 
-        if current_index + 1 < self.state.queue.len() {
-            self.start_track(current_index + 1, 0)?;
-        } else {
+        if self.state.queue.is_empty() {
             self.playback.stop()?;
             self.state.playback.state = PlaybackStatus::Stopped;
             self.state.playback.position_ms = 0;
             self.state.playback.current_queue_item_id = None;
-            self.normalize_queue_for_stop();
             self.publish_playback_state_changed()?;
             self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+        } else {
+            self.start_track(current_index.min(self.state.queue.len() - 1), 0)?;
         }
 
         Ok(())
@@ -672,9 +692,7 @@ where
         match current_index {
             Some(current_index) => {
                 for (index, item) in self.state.queue.iter_mut().enumerate() {
-                    item.status = if index < current_index {
-                        QueueItemStatus::Finished
-                    } else if index == current_index {
+                    item.status = if index == current_index {
                         current_status
                     } else {
                         QueueItemStatus::Queued
@@ -881,6 +899,105 @@ mod tests {
         assert_eq!(snapshot.search_jobs.len(), 1);
         assert_eq!(snapshot.playback.state, PlaybackStatus::Stopped);
         assert_eq!(snapshot.queue[0].status, QueueItemStatus::Queued);
+    }
+
+    #[test]
+    fn finish_current_track_removes_finished_item_and_autoplays_next() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.enqueue_song(song("song_1")).unwrap();
+        let second_queue_item_id = orchestrator
+            .enqueue_song(song("song_2"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        orchestrator.play().unwrap();
+
+        orchestrator.finish_current_track().unwrap();
+
+        assert_eq!(orchestrator.queue().len(), 1);
+        assert_eq!(orchestrator.queue()[0].song.id, "song_2");
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+        assert_eq!(
+            orchestrator.state().playback().current_queue_item_id.as_deref(),
+            Some(second_queue_item_id.as_str())
+        );
+    }
+
+    #[test]
+    fn next_removes_current_item_before_advancing() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.enqueue_song(song("song_1")).unwrap();
+        orchestrator.enqueue_song(song("song_2")).unwrap();
+        orchestrator.play().unwrap();
+
+        orchestrator.next().unwrap();
+
+        assert_eq!(orchestrator.queue().len(), 1);
+        assert_eq!(orchestrator.queue()[0].song.id, "song_2");
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+    }
+
+    #[test]
+    fn previous_restarts_current_track_without_history() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.enqueue_song(song("song_1")).unwrap();
+        orchestrator.play().unwrap();
+        orchestrator.seek(12_345).unwrap();
+
+        orchestrator.previous().unwrap();
+
+        assert_eq!(orchestrator.queue().len(), 1);
+        assert_eq!(orchestrator.queue()[0].song.id, "song_1");
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+        assert_eq!(orchestrator.state().playback().position_ms, 0);
+    }
+
+    #[test]
+    fn moving_before_current_item_is_rejected() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        let first_id = orchestrator.enqueue_song(song("song_1")).unwrap().queue_item_id.unwrap();
+        let second_id = orchestrator.enqueue_song(song("song_2")).unwrap().queue_item_id.unwrap();
+        orchestrator.play().unwrap();
+
+        let error = orchestrator.move_queue_item(&second_id, 0).unwrap_err();
+
+        match error {
+            CoreError::Conflict { code, message } => {
+                assert_eq!(code, "queue_move_before_current_not_allowed");
+                assert_eq!(message, "cannot move a queued item before the currently playing item");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        assert_eq!(orchestrator.state().playback().current_queue_item_id.as_deref(), Some(first_id.as_str()));
     }
 
     #[test]
