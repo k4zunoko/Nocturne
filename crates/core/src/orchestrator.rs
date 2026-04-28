@@ -380,6 +380,13 @@ where
             ));
         }
 
+        if self.state.playback.state == PlaybackStatus::Loading {
+            return Err(CoreError::conflict(
+                "playback_start_in_progress",
+                "cannot start playback while another track is still loading",
+            ));
+        }
+
         if self.state.playback.state == PlaybackStatus::Paused
             && self.current_index().is_some()
         {
@@ -413,6 +420,10 @@ where
     pub fn play_pause(&mut self) -> Result<CommandReceipt, CoreError> {
         match self.state.playback.state {
             PlaybackStatus::Playing => self.pause(),
+            PlaybackStatus::Loading => Err(CoreError::conflict(
+                "playback_start_in_progress",
+                "cannot toggle playback while a track is still loading",
+            )),
             PlaybackStatus::Paused | PlaybackStatus::Stopped => self.play(),
         }
     }
@@ -538,11 +549,10 @@ where
             .ok_or_else(|| CoreError::conflict("queue_empty", "no queue item available to play"))?;
         let track_changed = self.state.playback.current_queue_item_id.as_deref() != Some(item.id.as_str());
 
-        self.playback.start(&item, position_ms)?;
-        self.state.playback.state = PlaybackStatus::Playing;
+        self.state.playback.state = PlaybackStatus::Loading;
         self.state.playback.position_ms = position_ms;
         self.state.playback.current_queue_item_id = Some(item.id.clone());
-        self.apply_queue_statuses(Some(index), QueueItemStatus::Playing);
+        self.apply_queue_statuses(Some(index), QueueItemStatus::Loading);
 
         if track_changed {
             self.publish(
@@ -553,6 +563,28 @@ where
                 }),
             )?;
         }
+
+        self.publish_playback_state_changed()?;
+        self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+
+        if let Err(error) = self.playback.start(&item, position_ms) {
+            self.state.playback.state = PlaybackStatus::Stopped;
+            self.state.playback.position_ms = 0;
+            self.state.playback.current_queue_item_id = None;
+
+            if let Some(queue_item) = self.state.queue.get_mut(index) {
+                queue_item.status = QueueItemStatus::Failed;
+            }
+
+            self.publish_playback_state_changed()?;
+            self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+            return Err(error.into());
+        }
+
+        self.state.playback.state = PlaybackStatus::Playing;
+        self.state.playback.position_ms = position_ms;
+        self.state.playback.current_queue_item_id = Some(item.id.clone());
+        self.apply_queue_statuses(Some(index), QueueItemStatus::Playing);
 
         self.publish_playback_state_changed()?;
         self.publish_queue_updated(QueueUpdateReason::CurrentChanged)
