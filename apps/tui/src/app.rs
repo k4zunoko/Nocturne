@@ -100,6 +100,7 @@ pub struct App {
     display_position_ms: u64,
     playback_anchor_ms: u64,
     playback_anchor_at: Instant,
+    playback_progress_confirmed: bool,
 }
 
 impl App {
@@ -131,6 +132,7 @@ impl App {
             display_position_ms: 0,
             playback_anchor_ms: 0,
             playback_anchor_at: Instant::now(),
+            playback_progress_confirmed: false,
         }
     }
 
@@ -142,6 +144,7 @@ impl App {
         self.search_jobs = snapshot.search_jobs;
         self.last_event_id = current_event_id;
         self.sync_playback_anchor(self.playback.position_ms);
+        self.playback_progress_confirmed = self.playback.position_ms > 0;
         self.sync_current_song_from_queue();
         self.reconcile_queue_selection();
         self.set_status(
@@ -159,16 +162,21 @@ impl App {
                 self.playback.state = payload.state;
                 self.playback.current_queue_item_id = payload.current_queue_item_id;
                 self.playback.position_ms = payload.position_ms;
-                self.sync_playback_anchor(payload.position_ms);
+                if self.playback.state != PlaybackStatus::Playing {
+                    self.sync_playback_anchor(payload.position_ms);
+                    self.playback_progress_confirmed = false;
+                }
                 self.sync_current_song_from_queue();
             }
             BackendEventKind::PlaybackTrackChanged(payload) => {
                 self.playback.current_queue_item_id = Some(payload.queue_item_id);
                 self.current_song = Some(payload.song);
                 self.sync_playback_anchor(0);
+                self.playback_progress_confirmed = false;
             }
             BackendEventKind::PlaybackPositionUpdated(payload) => {
                 self.playback.position_ms = payload.position_ms;
+                 self.playback_progress_confirmed = true;
                 self.sync_playback_anchor(payload.position_ms);
             }
             BackendEventKind::QueueUpdated(payload) => {
@@ -721,6 +729,10 @@ impl App {
             return self.playback_anchor_ms;
         }
 
+        if !self.playback_progress_confirmed {
+            return self.playback_anchor_ms;
+        }
+
         let elapsed_ms = self.playback_anchor_at.elapsed().as_millis() as u64;
         let position_ms = self.playback_anchor_ms.saturating_add(elapsed_ms);
         let duration_ms = self.current_song.as_ref().map_or(u64::MAX, |song| song.duration_ms);
@@ -738,6 +750,7 @@ impl App {
         );
         let state_label = match self.playback.state {
             PlaybackStatus::Stopped => "Stopped",
+            PlaybackStatus::Loading => "Loading",
             PlaybackStatus::Playing => "Playing",
             PlaybackStatus::Paused => "Paused",
         };
