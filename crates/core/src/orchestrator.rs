@@ -303,6 +303,10 @@ where
         self.state.queue.push(item);
         self.publish_queue_updated(QueueUpdateReason::Add)?;
 
+        if self.should_autoplay_on_enqueue() {
+            self.start_track(0, 0)?;
+        }
+
         self.command_accepted(None, Some(queue_item_id))
     }
 
@@ -688,6 +692,12 @@ where
         }
     }
 
+    fn should_autoplay_on_enqueue(&self) -> bool {
+        self.state.playback.state == PlaybackStatus::Stopped
+            && self.state.playback.current_queue_item_id.is_none()
+            && !self.state.queue.is_empty()
+    }
+
     fn apply_queue_statuses(&mut self, current_index: Option<usize>, current_status: QueueItemStatus) {
         match current_index {
             Some(current_index) => {
@@ -834,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_and_play_updates_state() {
+    fn enqueue_autoplays_when_stopped() {
         let mut orchestrator = Orchestrator::new(
             StubClock,
             StubIds::default(),
@@ -844,14 +854,47 @@ mod tests {
         );
 
         orchestrator.enqueue_song(song("song_1")).unwrap();
-        assert_eq!(orchestrator.queue().len(), 1);
 
-        orchestrator.play().unwrap();
+        assert_eq!(orchestrator.queue().len(), 1);
         assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Playing);
         assert_eq!(
             orchestrator.state().playback().current_queue_item_id.as_deref(),
             Some("queue_item_0001")
         );
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+        assert_eq!(orchestrator.playback.started, vec!["queue_item_0001@0"]);
+    }
+
+    #[test]
+    fn enqueue_does_not_resume_when_paused() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.enqueue_song(song("song_1")).unwrap();
+        let first_queue_item_id = orchestrator
+            .state()
+            .playback()
+            .current_queue_item_id
+            .clone()
+            .unwrap();
+        orchestrator.pause().unwrap();
+
+        orchestrator.enqueue_song(song("song_2")).unwrap();
+
+        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Paused);
+        assert_eq!(
+            orchestrator.state().playback().current_queue_item_id.as_deref(),
+            Some(first_queue_item_id.as_str())
+        );
+        assert_eq!(orchestrator.queue().len(), 2);
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+        assert_eq!(orchestrator.queue()[1].status, QueueItemStatus::Queued);
+        assert_eq!(orchestrator.playback.started, vec!["queue_item_0001@0"]);
     }
 
     #[test]
@@ -1049,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn playback_port_errors_are_mapped_to_core_errors() {
+    fn enqueue_autoplay_errors_are_mapped_to_core_errors() {
         let mut orchestrator = Orchestrator::new(
             StubClock,
             StubIds::default(),
@@ -1058,8 +1101,7 @@ mod tests {
             StubSearch::default(),
         );
 
-        orchestrator.enqueue_song(song("song_1")).unwrap();
-        let error = orchestrator.play().unwrap_err();
+        let error = orchestrator.enqueue_song(song("song_1")).unwrap_err();
 
         match error {
             CoreError::Port { code, message } => {
@@ -1068,5 +1110,10 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+
+        assert_eq!(orchestrator.queue().len(), 1);
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Failed);
+        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Stopped);
+        assert_eq!(orchestrator.state().playback().current_queue_item_id, None);
     }
 }
