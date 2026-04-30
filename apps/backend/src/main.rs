@@ -31,7 +31,7 @@ use nocturne_domain::PlaybackStatus;
 use nocturne_infrastructure::{
     BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalClock, LocalEventLog,
     LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter, LocalSearchRuntime,
-    SharedPlaybackState,
+    PlaybackStartStatus, SharedPlaybackState,
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -129,6 +129,60 @@ fn spawn_playback_monitor(
         loop {
             let snapshot = playback_state.snapshot();
             let current_queue_item_id = snapshot.current_item.as_ref().map(|item| item.id.clone());
+
+            match &snapshot.start_status {
+                PlaybackStartStatus::Idle | PlaybackStartStatus::Pending { .. } => {}
+                PlaybackStartStatus::Ready {
+                    queue_item_id,
+                    position_ms,
+                } => {
+                    let mut orchestrator = orchestrator.lock().await;
+                    match orchestrator.confirm_playback_started(queue_item_id, *position_ms) {
+                        Ok(true) => {}
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "failed to confirm playback start for {}: {error}",
+                                queue_item_id
+                            );
+                        }
+                    }
+                }
+                PlaybackStartStatus::Failed {
+                    queue_item_id,
+                    code,
+                    message,
+                } => {
+                    let mut orchestrator = orchestrator.lock().await;
+                    match orchestrator.report_playback_start_failed(queue_item_id) {
+                        Ok(true) => {
+                            if let Err(error) = orchestrator.emit_system_error(
+                                code.clone(),
+                                user_message_for_playback_failure(code),
+                                CoreSystemErrorSeverity::Error,
+                            ) {
+                                eprintln!(
+                                    "failed to emit async playback start error for {}: {error}",
+                                    queue_item_id
+                                );
+                            } else {
+                                eprintln!(
+                                    "playback start failed for {}: {}",
+                                    queue_item_id,
+                                    message
+                                );
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            eprintln!(
+                                "failed to mark playback start failure for {}: {error}",
+                                queue_item_id
+                            );
+                        }
+                    }
+                }
+            }
 
             if current_queue_item_id.is_none() {
                 last_position = None;
@@ -1492,7 +1546,7 @@ mod tests {
             source_url: String::from("https://www.youtube.com/watch?v=current-song"),
         };
         let queue_item_id = orchestrator.enqueue_song(song).unwrap().queue_item_id.unwrap();
-        orchestrator.play().unwrap();
+        orchestrator.confirm_playback_started(&queue_item_id, 0).unwrap();
 
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
@@ -1550,6 +1604,8 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
+        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
+        orchestrator.stop().unwrap();
 
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
@@ -1685,7 +1741,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(response.status(), StatusCode::CONFLICT);
 
         let response = app
             .oneshot(
@@ -1699,7 +1755,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: nocturne_domain::PlaybackState = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload.state, nocturne_domain::PlaybackStatus::Playing);
+        assert_eq!(payload.state, nocturne_domain::PlaybackStatus::Loading);
         assert!(payload.current_queue_item_id.is_some());
     }
 
@@ -1723,7 +1779,7 @@ mod tests {
                 source_url: String::from("https://example.com/a"),
             })
             .unwrap();
-        orchestrator.play().unwrap();
+        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
 
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
