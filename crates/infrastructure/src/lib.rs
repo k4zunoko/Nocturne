@@ -9,7 +9,7 @@ use std::fmt::{self, Display, Formatter};
 use std::sync::{Mutex, MutexGuard};
 
 pub use audio::{
-    LocalPlaybackAdapter, LocalPlaybackSnapshot, PlaybackCommand, PlaybackStartStatus,
+    LocalPlaybackAdapter, LocalPlaybackSnapshot, PlaybackCommand, PlaybackWorkerEvent,
     SharedPlaybackState,
 };
 pub use clock::LocalClock;

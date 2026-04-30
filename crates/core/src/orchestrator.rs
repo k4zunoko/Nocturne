@@ -8,9 +8,9 @@ use nocturne_domain::{
 
 use crate::models::{
     BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreSnapshot,
-    PlaybackPositionUpdatedEvent, PlaybackStateChangedEvent, PlaybackTrackChangedEvent,
-    QueueUpdateReason, QueueUpdatedEvent, SearchJobCompletedEvent, SearchJobFailedEvent,
-    SearchJobRecord, SearchJobStatus, SearchResultsRecord, SystemErrorEvent, SystemErrorSeverity,
+    PlaybackProgressEvent, SearchJobCompletedEvent, SearchJobFailedEvent, SearchJobRecord,
+    SearchJobStatus, SearchResultsRecord, StateUpdatedEvent, SystemErrorEvent,
+    SystemErrorSeverity,
 };
 use crate::ports::{
     ClockPort, EventPublisherPort, IdGeneratorPort, IdKind, PlaybackPort, PortError, SearchPort,
@@ -80,6 +80,7 @@ pub struct OrchestratorState {
     queue: Vec<QueueItem>,
     search_jobs: Vec<SearchJobRecord>,
     search_results: BTreeMap<String, Vec<Song>>,
+    revision: u64,
 }
 
 impl Default for OrchestratorState {
@@ -93,11 +94,13 @@ impl Default for OrchestratorState {
                 state: PlaybackStatus::Stopped,
                 position_ms: 0,
                 current_queue_item_id: None,
+                playback_session_id: None,
             },
             audio: AudioSettings::default(),
             queue: Vec::new(),
             search_jobs: Vec::new(),
             search_results: BTreeMap::new(),
+            revision: 0,
         }
     }
 }
@@ -157,6 +160,7 @@ where
             current_song: self.current_song().cloned(),
             queue: self.state.queue.clone(),
             search_jobs: self.state.search_jobs.clone(),
+            revision: self.state.revision,
             snapshot_id: self.ids.next_id(IdKind::Snapshot),
             timestamp: self.clock.now(),
         }
@@ -203,7 +207,7 @@ where
         let settings = AudioSettings::new(volume_percent);
         self.playback.set_volume(settings.gain())?;
         self.state.audio = settings;
-        self.publish_audio_settings_changed()?;
+        self.publish_state_updated()?;
         self.command_accepted(None, None)
     }
 
@@ -314,7 +318,7 @@ where
         };
         let queue_item_id = item.id.clone();
         self.state.queue.push(item);
-        self.publish_queue_updated(QueueUpdateReason::Add)?;
+        self.publish_state_updated()?;
 
         if self.should_autoplay_on_enqueue() {
             self.start_track(0, 0)?;
@@ -342,7 +346,7 @@ where
 
         self.state.queue.remove(removed_index);
 
-        self.publish_queue_updated(QueueUpdateReason::Remove)?;
+        self.publish_state_updated()?;
         self.command_accepted(None, None)
     }
 
@@ -390,18 +394,18 @@ where
             self.apply_queue_statuses(Some(current_index), QueueItemStatus::Playing);
         }
 
-        self.publish_queue_updated(QueueUpdateReason::Move)?;
+        self.publish_state_updated()?;
         self.command_accepted(None, None)
     }
 
     pub fn clear_queue(&mut self) -> Result<CommandReceipt, CoreError> {
-        self.state.queue.clear();
         self.playback.stop()?;
+        self.state.queue.clear();
         self.state.playback.state = PlaybackStatus::Stopped;
         self.state.playback.position_ms = 0;
         self.state.playback.current_queue_item_id = None;
-        self.publish_playback_state_changed()?;
-        self.publish_queue_updated(QueueUpdateReason::Clear)?;
+        self.state.playback.playback_session_id = None;
+        self.publish_state_updated()?;
 
         self.command_accepted(None, None)
     }
@@ -424,7 +428,7 @@ where
         if self.state.playback.state == PlaybackStatus::Paused && self.current_index().is_some() {
             self.playback.resume()?;
             self.state.playback.state = PlaybackStatus::Playing;
-            self.publish_playback_state_changed()?;
+            self.publish_state_updated()?;
             return self.command_accepted(None, None);
         }
 
@@ -444,7 +448,7 @@ where
 
         self.playback.pause()?;
         self.state.playback.state = PlaybackStatus::Paused;
-        self.publish_playback_state_changed()?;
+        self.publish_state_updated()?;
 
         self.command_accepted(None, None)
     }
@@ -465,9 +469,9 @@ where
         self.state.playback.state = PlaybackStatus::Stopped;
         self.state.playback.position_ms = 0;
         self.state.playback.current_queue_item_id = None;
+        self.state.playback.playback_session_id = None;
         self.normalize_queue_for_stop();
-        self.publish_playback_state_changed()?;
-        self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+        self.publish_state_updated()?;
 
         self.command_accepted(None, None)
     }
@@ -482,8 +486,8 @@ where
                     self.state.playback.state = PlaybackStatus::Stopped;
                     self.state.playback.position_ms = 0;
                     self.state.playback.current_queue_item_id = None;
-                    self.publish_playback_state_changed()?;
-                    self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+                    self.state.playback.playback_session_id = None;
+                    self.publish_state_updated()?;
                 } else {
                     self.start_track(current_index.min(self.state.queue.len() - 1), 0)?;
                 }
@@ -532,21 +536,48 @@ where
         }
 
         self.playback.seek(position_ms)?;
-        self.note_position(position_ms)?;
+        let playback_session_id = self
+            .state
+            .playback
+            .playback_session_id
+            .clone()
+            .ok_or_else(|| CoreError::conflict("no_playback_session", "cannot seek without an active playback session"))?;
+        self.report_playback_progress(&playback_session_id, position_ms)?;
         self.command_accepted(None, None)
     }
 
-    pub fn note_position(&mut self, position_ms: u64) -> Result<(), CoreError> {
+    pub fn report_playback_progress(
+        &mut self,
+        playback_session_id: &str,
+        position_ms: u64,
+    ) -> Result<bool, CoreError> {
+        if self.state.playback.playback_session_id.as_deref() != Some(playback_session_id) {
+            return Ok(false);
+        }
+
+        if self.state.playback.position_ms == position_ms {
+            return Ok(false);
+        }
+
         self.state.playback.position_ms = position_ms;
         self.publish(
-            CoreEventKind::PlaybackPositionUpdated,
-            CoreEvent::PlaybackPositionUpdated(PlaybackPositionUpdatedEvent { position_ms }),
-        )
+            CoreEventKind::PlaybackProgress,
+            CoreEvent::PlaybackProgress(PlaybackProgressEvent {
+                playback_session_id: playback_session_id.to_owned(),
+                position_ms,
+            }),
+        )?;
+        Ok(true)
     }
 
-    pub fn finish_current_track(&mut self) -> Result<(), CoreError> {
+    pub fn finish_current_track(&mut self, playback_session_id: &str, position_ms: u64) -> Result<bool, CoreError> {
+        if self.state.playback.playback_session_id.as_deref() != Some(playback_session_id) {
+            return Ok(false);
+        }
+
+        self.state.playback.position_ms = position_ms;
         let Some(current_index) = self.current_index() else {
-            return Ok(());
+            return Ok(false);
         };
 
         self.state.queue.remove(current_index);
@@ -556,22 +587,24 @@ where
             self.state.playback.state = PlaybackStatus::Stopped;
             self.state.playback.position_ms = 0;
             self.state.playback.current_queue_item_id = None;
-            self.publish_playback_state_changed()?;
-            self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+            self.state.playback.playback_session_id = None;
+            self.publish_state_updated()?;
         } else {
             self.start_track(current_index.min(self.state.queue.len() - 1), 0)?;
         }
 
-        Ok(())
+        Ok(true)
     }
 
     pub fn confirm_playback_started(
         &mut self,
+        playback_session_id: &str,
         queue_item_id: &str,
         position_ms: u64,
     ) -> Result<bool, CoreError> {
         if self.state.playback.state != PlaybackStatus::Loading
             || self.state.playback.current_queue_item_id.as_deref() != Some(queue_item_id)
+            || self.state.playback.playback_session_id.as_deref() != Some(playback_session_id)
         {
             return Ok(false);
         }
@@ -583,14 +616,18 @@ where
             self.apply_queue_statuses(Some(current_index), QueueItemStatus::Playing);
         }
 
-        self.publish_playback_state_changed()?;
-        self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+        self.publish_state_updated()?;
         Ok(true)
     }
 
-    pub fn report_playback_start_failed(&mut self, queue_item_id: &str) -> Result<bool, CoreError> {
+    pub fn report_playback_start_failed(
+        &mut self,
+        playback_session_id: &str,
+        queue_item_id: &str,
+    ) -> Result<bool, CoreError> {
         if self.state.playback.state != PlaybackStatus::Loading
             || self.state.playback.current_queue_item_id.as_deref() != Some(queue_item_id)
+            || self.state.playback.playback_session_id.as_deref() != Some(playback_session_id)
         {
             return Ok(false);
         }
@@ -598,6 +635,7 @@ where
         self.state.playback.state = PlaybackStatus::Stopped;
         self.state.playback.position_ms = 0;
         self.state.playback.current_queue_item_id = None;
+        self.state.playback.playback_session_id = None;
 
         if let Some(queue_item) = self
             .state
@@ -608,8 +646,7 @@ where
             queue_item.status = QueueItemStatus::Failed;
         }
 
-        self.publish_playback_state_changed()?;
-        self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+        self.publish_state_updated()?;
         Ok(true)
     }
 
@@ -634,69 +671,39 @@ where
             self.state.queue.get(index).cloned().ok_or_else(|| {
                 CoreError::conflict("queue_empty", "no queue item available to play")
             })?;
-        let track_changed =
-            self.state.playback.current_queue_item_id.as_deref() != Some(item.id.as_str());
+        let playback_session_id = self.ids.next_id(IdKind::PlaybackSession);
 
         self.state.playback.state = PlaybackStatus::Loading;
         self.state.playback.position_ms = position_ms;
         self.state.playback.current_queue_item_id = Some(item.id.clone());
+        self.state.playback.playback_session_id = Some(playback_session_id.clone());
         self.apply_queue_statuses(Some(index), QueueItemStatus::Loading);
 
-        if track_changed {
-            self.publish(
-                CoreEventKind::PlaybackTrackChanged,
-                CoreEvent::PlaybackTrackChanged(PlaybackTrackChangedEvent {
-                    queue_item_id: item.id.clone(),
-                    song: item.song.clone(),
-                }),
-            )?;
-        }
+        self.publish_state_updated()?;
 
-        self.publish_playback_state_changed()?;
-        self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
-
-        if let Err(error) = self.playback.start(&item, position_ms) {
+        if let Err(error) = self.playback.start(&item, &playback_session_id, position_ms) {
             self.state.playback.state = PlaybackStatus::Stopped;
             self.state.playback.position_ms = 0;
             self.state.playback.current_queue_item_id = None;
+            self.state.playback.playback_session_id = None;
 
             if let Some(queue_item) = self.state.queue.get_mut(index) {
                 queue_item.status = QueueItemStatus::Failed;
             }
 
-            self.publish_playback_state_changed()?;
-            self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+            self.publish_state_updated()?;
             return Err(error.into());
         }
 
         Ok(())
     }
 
-    fn publish_playback_state_changed(&mut self) -> Result<(), CoreError> {
+    fn publish_state_updated(&mut self) -> Result<(), CoreError> {
+        self.state.revision = self.state.revision.saturating_add(1);
+        let snapshot = self.snapshot();
         self.publish(
-            CoreEventKind::PlaybackStateChanged,
-            CoreEvent::PlaybackStateChanged(PlaybackStateChangedEvent {
-                state: self.state.playback.state,
-                current_queue_item_id: self.state.playback.current_queue_item_id.clone(),
-                position_ms: self.state.playback.position_ms,
-            }),
-        )
-    }
-
-    fn publish_audio_settings_changed(&mut self) -> Result<(), CoreError> {
-        self.publish(
-            CoreEventKind::AudioSettingsChanged,
-            CoreEvent::AudioSettingsChanged(self.state.audio),
-        )
-    }
-
-    fn publish_queue_updated(&mut self, reason: QueueUpdateReason) -> Result<(), CoreError> {
-        self.publish(
-            CoreEventKind::QueueUpdated,
-            CoreEvent::QueueUpdated(QueueUpdatedEvent {
-                reason,
-                items: self.state.queue.clone(),
-            }),
+            CoreEventKind::StateUpdated,
+            CoreEvent::StateUpdated(StateUpdatedEvent { snapshot }),
         )
     }
 
@@ -850,6 +857,7 @@ mod tests {
                 IdKind::Command => "cmd",
                 IdKind::Event => "evt",
                 IdKind::Snapshot => "snap",
+                IdKind::PlaybackSession => "playback_session",
                 IdKind::QueueItem => "queue_item",
                 IdKind::SearchJob => "job",
             };
@@ -877,11 +885,18 @@ mod tests {
         resumed: usize,
         stopped: usize,
         seeks: Vec<u64>,
+        fail_stop: bool,
     }
 
     impl PlaybackPort for StubPlayback {
-        fn start(&mut self, item: &QueueItem, position_ms: u64) -> Result<(), PortError> {
-            self.started.push(format!("{}@{}", item.id, position_ms));
+        fn start(
+            &mut self,
+            item: &QueueItem,
+            playback_session_id: &str,
+            position_ms: u64,
+        ) -> Result<(), PortError> {
+            self.started
+                .push(format!("{}:{}@{}", playback_session_id, item.id, position_ms));
             Ok(())
         }
 
@@ -901,6 +916,12 @@ mod tests {
         }
 
         fn stop(&mut self) -> Result<(), PortError> {
+            if self.fail_stop {
+                return Err(PortError::new(
+                    "playback_stop_failed",
+                    "stub stop failure",
+                ));
+            }
             self.stopped += 1;
             Ok(())
         }
@@ -933,6 +954,22 @@ mod tests {
         }
     }
 
+    fn current_session_id<C, I, E, P, S>(orchestrator: &Orchestrator<C, I, E, P, S>) -> String
+    where
+        C: ClockPort,
+        I: IdGeneratorPort,
+        E: EventPublisherPort,
+        P: PlaybackPort,
+        S: SearchPort,
+    {
+        orchestrator
+            .state()
+            .playback()
+            .playback_session_id
+            .clone()
+            .expect("expected playback session id")
+    }
+
     #[test]
     fn enqueue_autoplays_when_stopped() {
         let mut orchestrator = Orchestrator::new(
@@ -959,10 +996,14 @@ mod tests {
             Some("queue_item_0001")
         );
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Loading);
-        assert_eq!(orchestrator.playback.started, vec!["queue_item_0001@0"]);
+        let playback_session_id = current_session_id(&orchestrator);
+        assert_eq!(
+            orchestrator.playback.started,
+            vec![format!("{playback_session_id}:queue_item_0001@0")]
+        );
 
         orchestrator
-            .confirm_playback_started("queue_item_0001", 0)
+            .confirm_playback_started(&playback_session_id, "queue_item_0001", 0)
             .unwrap();
 
         assert_eq!(
@@ -989,8 +1030,9 @@ mod tests {
             .current_queue_item_id
             .clone()
             .unwrap();
+        let first_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started(&first_queue_item_id, 0)
+            .confirm_playback_started(&first_session_id, &first_queue_item_id, 0)
             .unwrap();
         orchestrator.pause().unwrap();
 
@@ -1011,7 +1053,10 @@ mod tests {
         assert_eq!(orchestrator.queue().len(), 2);
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
         assert_eq!(orchestrator.queue()[1].status, QueueItemStatus::Queued);
-        assert_eq!(orchestrator.playback.started, vec!["queue_item_0001@0"]);
+        assert_eq!(
+            orchestrator.playback.started,
+            vec![format!("{first_session_id}:queue_item_0001@0")]
+        );
     }
 
     #[test]
@@ -1056,8 +1101,9 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
+        let playback_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started(&queue_item_id, 0)
+            .confirm_playback_started(&playback_session_id, &queue_item_id, 0)
             .unwrap();
         orchestrator.seek(12_345).unwrap();
         orchestrator.stop().unwrap();
@@ -1085,10 +1131,14 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
+        let first_session_id = current_session_id(&orchestrator);
 
-        orchestrator.finish_current_track().unwrap();
         orchestrator
-            .confirm_playback_started(&second_queue_item_id, 0)
+            .finish_current_track(&first_session_id, 180_000)
+            .unwrap();
+        let second_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&second_session_id, &second_queue_item_id, 0)
             .unwrap();
 
         assert_eq!(orchestrator.queue().len(), 1);
@@ -1120,13 +1170,15 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
+        let first_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started("queue_item_0001", 0)
+            .confirm_playback_started(&first_session_id, "queue_item_0001", 0)
             .unwrap();
 
         orchestrator.next().unwrap();
+        let second_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started(&second_queue_item_id, 0)
+            .confirm_playback_started(&second_session_id, &second_queue_item_id, 0)
             .unwrap();
 
         assert_eq!(orchestrator.queue().len(), 1);
@@ -1145,14 +1197,16 @@ mod tests {
         );
 
         orchestrator.enqueue_song(song("song_1")).unwrap();
+        let first_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started("queue_item_0001", 0)
+            .confirm_playback_started(&first_session_id, "queue_item_0001", 0)
             .unwrap();
         orchestrator.seek(12_345).unwrap();
 
         orchestrator.previous().unwrap();
+        let second_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started("queue_item_0001", 0)
+            .confirm_playback_started(&second_session_id, "queue_item_0001", 0)
             .unwrap();
 
         assert_eq!(orchestrator.queue().len(), 1);
@@ -1181,7 +1235,10 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
-        orchestrator.confirm_playback_started(&first_id, 0).unwrap();
+        let playback_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&playback_session_id, &first_id, 0)
+            .unwrap();
 
         let error = orchestrator.move_queue_item(&second_id, 0).unwrap_err();
 
@@ -1217,8 +1274,9 @@ mod tests {
         );
 
         orchestrator.enqueue_song(song("song_1")).unwrap();
+        let playback_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started("queue_item_0001", 0)
+            .confirm_playback_started(&playback_session_id, "queue_item_0001", 0)
             .unwrap();
 
         let error = orchestrator
@@ -1237,7 +1295,12 @@ mod tests {
     struct FailingPlayback;
 
     impl PlaybackPort for FailingPlayback {
-        fn start(&mut self, _item: &QueueItem, _position_ms: u64) -> Result<(), PortError> {
+        fn start(
+            &mut self,
+            _item: &QueueItem,
+            _playback_session_id: &str,
+            _position_ms: u64,
+        ) -> Result<(), PortError> {
             Err(PortError::new(
                 "playback_start_failed",
                 "stub start failure",
@@ -1316,8 +1379,9 @@ mod tests {
         );
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Loading);
 
+        let playback_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started(&queue_item_id, 321)
+            .confirm_playback_started(&playback_session_id, &queue_item_id, 321)
             .unwrap();
 
         assert_eq!(
@@ -1362,9 +1426,10 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
+        let playback_session_id = current_session_id(&orchestrator);
 
         orchestrator
-            .report_playback_start_failed(&queue_item_id)
+            .report_playback_start_failed(&playback_session_id, &queue_item_id)
             .unwrap();
 
         assert_eq!(
@@ -1396,5 +1461,38 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[test]
+    fn clear_queue_does_not_mutate_state_when_stop_fails() {
+        let playback = StubPlayback {
+            fail_stop: true,
+            ..Default::default()
+        };
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            playback,
+            StubSearch::default(),
+        );
+
+        orchestrator.enqueue_song(song("song_1")).unwrap();
+        let error = orchestrator.clear_queue().unwrap_err();
+
+        match error {
+            CoreError::Port { code, message } => {
+                assert_eq!(code, "playback_stop_failed");
+                assert_eq!(message, "stub stop failure");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        assert_eq!(orchestrator.queue().len(), 1);
+        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Loading);
+        assert_eq!(
+            orchestrator.state().playback().current_queue_item_id.as_deref(),
+            Some("queue_item_0001")
+        );
     }
 }

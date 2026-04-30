@@ -12,6 +12,7 @@ use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::recover_lock;
 
@@ -25,6 +26,7 @@ const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaybackCommand {
     Start {
+        playback_session_id: String,
         queue_item_id: String,
         position_ms: u64,
     },
@@ -39,19 +41,25 @@ pub enum PlaybackCommand {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum PlaybackStartStatus {
-    #[default]
-    Idle,
-    Pending {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaybackWorkerEvent {
+    Started {
+        playback_session_id: String,
         queue_item_id: String,
         position_ms: u64,
     },
-    Ready {
+    Progress {
+        playback_session_id: String,
+        position_ms: u64,
+        paused: bool,
+    },
+    Ended {
+        playback_session_id: String,
         queue_item_id: String,
         position_ms: u64,
     },
-    Failed {
+    StartFailed {
+        playback_session_id: String,
         queue_item_id: String,
         code: String,
         message: String,
@@ -61,10 +69,9 @@ pub enum PlaybackStartStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPlaybackSnapshot {
     pub current_item: Option<QueueItem>,
+    pub playback_session_id: Option<String>,
     pub position_ms: u64,
     pub paused: bool,
-    pub finished_queue_item_id: Option<String>,
-    pub start_status: PlaybackStartStatus,
     pub volume_percent: u8,
     pub history: Vec<PlaybackCommand>,
 }
@@ -73,10 +80,9 @@ impl Default for LocalPlaybackSnapshot {
     fn default() -> Self {
         Self {
             current_item: None,
+            playback_session_id: None,
             position_ms: 0,
             paused: false,
-            finished_queue_item_id: None,
-            start_status: PlaybackStartStatus::Idle,
             volume_percent: AudioSettings::DEFAULT_VOLUME_PERCENT,
             history: Vec::new(),
         }
@@ -103,10 +109,10 @@ pub struct LocalPlaybackAdapter {
 
 impl LocalPlaybackAdapter {
     #[must_use]
-    pub fn new(state: SharedPlaybackState) -> Self {
+    pub fn new(state: SharedPlaybackState, event_tx: UnboundedSender<PlaybackWorkerEvent>) -> Self {
         let (commands, receiver) = mpsc::sync_channel(8);
         let worker_state = state.clone();
-        let worker = thread::spawn(move || playback_worker_loop(receiver, worker_state));
+        let worker = thread::spawn(move || playback_worker_loop(receiver, worker_state, event_tx));
 
         Self {
             commands,
@@ -139,9 +145,15 @@ impl LocalPlaybackAdapter {
 }
 
 impl PlaybackPort for LocalPlaybackAdapter {
-    fn start(&mut self, item: &QueueItem, position_ms: u64) -> Result<(), PortError> {
+    fn start(
+        &mut self,
+        item: &QueueItem,
+        playback_session_id: &str,
+        position_ms: u64,
+    ) -> Result<(), PortError> {
         self.send_command(WorkerCommand::Start {
             item: item.clone(),
+            playback_session_id: playback_session_id.to_owned(),
             position_ms,
         })
     }
@@ -183,6 +195,7 @@ impl Drop for LocalPlaybackAdapter {
 enum WorkerCommand {
     Start {
         item: QueueItem,
+        playback_session_id: String,
         position_ms: u64,
     },
     Pause {
@@ -206,27 +219,44 @@ enum WorkerCommand {
 }
 
 enum ActivePlayback {
-    Simulated,
+    Simulated {
+        playback_session_id: String,
+        anchor_at: Instant,
+        base_position_ms: u64,
+        duration_ms: u64,
+        paused: bool,
+    },
     Rodio {
+        playback_session_id: String,
         queue_item_id: String,
         _sink: MixerDeviceSink,
         player: Player,
     },
 }
 
-fn playback_worker_loop(receiver: mpsc::Receiver<WorkerCommand>, state: SharedPlaybackState) {
+fn playback_worker_loop(
+    receiver: mpsc::Receiver<WorkerCommand>,
+    state: SharedPlaybackState,
+    event_tx: UnboundedSender<PlaybackWorkerEvent>,
+) {
     let mut active = None;
     let mut playback_runtime = None;
     let mut volume_percent = AudioSettings::DEFAULT_VOLUME_PERCENT;
 
     loop {
         match receiver.recv_timeout(WORKER_POLL_INTERVAL) {
-            Ok(WorkerCommand::Start { item, position_ms }) => {
+            Ok(WorkerCommand::Start {
+                item,
+                playback_session_id,
+                position_ms,
+            }) => {
                 handle_start(
                     &state,
                     &mut active,
                     &mut playback_runtime,
+                    &event_tx,
                     item,
+                    playback_session_id,
                     position_ms,
                     volume_percent,
                 );
@@ -239,22 +269,22 @@ fn playback_worker_loop(receiver: mpsc::Receiver<WorkerCommand>, state: SharedPl
                 let _ = reply.send(handle_set_volume(&state, &active, volume_percent));
             }
             Ok(WorkerCommand::Pause { reply }) => {
-                let _ = reply.send(handle_pause(&state, &active));
+                let _ = reply.send(handle_pause(&state, &mut active));
             }
             Ok(WorkerCommand::Resume { reply }) => {
-                let _ = reply.send(handle_resume(&state, &active));
+                let _ = reply.send(handle_resume(&state, &mut active));
             }
             Ok(WorkerCommand::Stop { reply }) => {
                 let _ = reply.send(handle_stop(&state, &mut active));
             }
             Ok(WorkerCommand::Seek { position_ms, reply }) => {
-                let _ = reply.send(handle_seek(&state, &active, position_ms));
+                let _ = reply.send(handle_seek(&state, &mut active, position_ms));
             }
             Ok(WorkerCommand::Shutdown) | Err(RecvTimeoutError::Disconnected) => {
                 clear_active_playback(&state, &mut active, false);
                 break;
             }
-            Err(RecvTimeoutError::Timeout) => poll_active_playback(&state, &mut active),
+            Err(RecvTimeoutError::Timeout) => poll_active_playback(&state, &mut active, &event_tx),
         }
     }
 }
@@ -263,36 +293,43 @@ fn handle_start(
     state: &SharedPlaybackState,
     active: &mut Option<ActivePlayback>,
     playback_runtime: &mut Option<Runtime>,
+    event_tx: &UnboundedSender<PlaybackWorkerEvent>,
     item: QueueItem,
+    playback_session_id: String,
     position_ms: u64,
     volume_percent: u8,
 ) {
     clear_active_playback(state, active, false);
 
-    {
-        let mut snapshot = recover_lock(&state.inner);
-        snapshot.start_status = PlaybackStartStatus::Pending {
-            queue_item_id: item.id.clone(),
-            position_ms,
-        };
-    }
-
     let next_active = if should_simulate_source(&item.song.source_url) {
-        ActivePlayback::Simulated
+        ActivePlayback::Simulated {
+            playback_session_id: playback_session_id.clone(),
+            anchor_at: Instant::now(),
+            base_position_ms: position_ms,
+            duration_ms: item.song.duration_ms,
+            paused: false,
+        }
     } else {
-        match open_real_playback(&item, position_ms, playback_runtime, volume_percent) {
+        match open_real_playback(
+            &item,
+            &playback_session_id,
+            position_ms,
+            playback_runtime,
+            volume_percent,
+        ) {
             Ok(active_playback) => active_playback,
             Err(error) => {
                 let mut snapshot = recover_lock(&state.inner);
                 snapshot.current_item = None;
+                snapshot.playback_session_id = None;
                 snapshot.position_ms = 0;
                 snapshot.paused = false;
-                snapshot.finished_queue_item_id = None;
-                snapshot.start_status = PlaybackStartStatus::Failed {
+                let _ = event_tx.send(PlaybackWorkerEvent::StartFailed {
+                    playback_session_id,
                     queue_item_id: item.id.clone(),
                     code: error.code().to_owned(),
                     message: error.message().to_owned(),
-                };
+                });
                 return;
             }
         }
@@ -301,29 +338,47 @@ fn handle_start(
     {
         let mut snapshot = recover_lock(&state.inner);
         snapshot.current_item = Some(item.clone());
+        snapshot.playback_session_id = Some(playback_session_id.clone());
         snapshot.position_ms = position_ms;
         snapshot.paused = false;
         snapshot.volume_percent = volume_percent;
-        snapshot.finished_queue_item_id = None;
         snapshot.history.push(PlaybackCommand::Start {
+            playback_session_id: playback_session_id.clone(),
             queue_item_id: item.id.clone(),
             position_ms,
         });
-        snapshot.start_status = PlaybackStartStatus::Ready {
-            queue_item_id: item.id.clone(),
-            position_ms,
-        };
     }
+
+    let _ = event_tx.send(PlaybackWorkerEvent::Started {
+        playback_session_id,
+        queue_item_id: item.id.clone(),
+        position_ms,
+    });
 
     *active = Some(next_active);
 }
 
 fn handle_pause(
     state: &SharedPlaybackState,
-    active: &Option<ActivePlayback>,
+    active: &mut Option<ActivePlayback>,
 ) -> Result<(), PortError> {
-    if let Some(ActivePlayback::Rodio { player, .. }) = active.as_ref() {
-        player.pause();
+    match active.as_mut() {
+        Some(ActivePlayback::Simulated {
+            anchor_at,
+            base_position_ms,
+            duration_ms,
+            paused,
+            ..
+        }) => {
+            if !*paused {
+                *base_position_ms = simulated_position_ms(*anchor_at, *base_position_ms, *duration_ms);
+                *paused = true;
+            }
+        }
+        Some(ActivePlayback::Rodio { player, .. }) => {
+            player.pause();
+        }
+        None => {}
     }
 
     let mut snapshot = recover_lock(&state.inner);
@@ -351,10 +406,23 @@ fn handle_set_volume(
 
 fn handle_resume(
     state: &SharedPlaybackState,
-    active: &Option<ActivePlayback>,
+    active: &mut Option<ActivePlayback>,
 ) -> Result<(), PortError> {
-    if let Some(ActivePlayback::Rodio { player, .. }) = active.as_ref() {
-        player.play();
+    match active.as_mut() {
+        Some(ActivePlayback::Simulated {
+            anchor_at,
+            paused,
+            ..
+        }) => {
+            if *paused {
+                *anchor_at = Instant::now();
+                *paused = false;
+            }
+        }
+        Some(ActivePlayback::Rodio { player, .. }) => {
+            player.play();
+        }
+        None => {}
     }
 
     let mut snapshot = recover_lock(&state.inner);
@@ -373,18 +441,30 @@ fn handle_stop(
 
 fn handle_seek(
     state: &SharedPlaybackState,
-    active: &Option<ActivePlayback>,
+    active: &mut Option<ActivePlayback>,
     position_ms: u64,
 ) -> Result<(), PortError> {
-    if let Some(ActivePlayback::Rodio { player, .. }) = active.as_ref() {
-        player
-            .try_seek(Duration::from_millis(position_ms))
-            .map_err(|error| {
-                PortError::new(
-                    "playback_seek_failed",
-                    format!("failed to seek active playback: {error}"),
-                )
-            })?;
+    match active.as_mut() {
+        Some(ActivePlayback::Simulated {
+            anchor_at,
+            base_position_ms,
+            duration_ms,
+            ..
+        }) => {
+            *base_position_ms = position_ms.min(*duration_ms);
+            *anchor_at = Instant::now();
+        }
+        Some(ActivePlayback::Rodio { player, .. }) => {
+            player
+                .try_seek(Duration::from_millis(position_ms))
+                .map_err(|error| {
+                    PortError::new(
+                        "playback_seek_failed",
+                        format!("failed to seek active playback: {error}"),
+                    )
+                })?;
+        }
+        None => {}
     }
 
     let mut snapshot = recover_lock(&state.inner);
@@ -393,23 +473,54 @@ fn handle_seek(
     Ok(())
 }
 
-fn poll_active_playback(state: &SharedPlaybackState, active: &mut Option<ActivePlayback>) {
+fn poll_active_playback(
+    state: &SharedPlaybackState,
+    active: &mut Option<ActivePlayback>,
+    event_tx: &UnboundedSender<PlaybackWorkerEvent>,
+) {
     let Some(active_playback) = active.as_ref() else {
         return;
     };
 
-    let (position_ms, paused, finished_queue_item_id) = match active_playback {
-        ActivePlayback::Simulated { .. } => return,
+    let (playback_session_id, queue_item_id, position_ms, paused, finished) = match active_playback {
+        ActivePlayback::Simulated {
+            playback_session_id,
+            anchor_at,
+            base_position_ms,
+            duration_ms,
+            paused,
+        } => {
+            let position_ms = if *paused {
+                *base_position_ms
+            } else {
+                simulated_position_ms(*anchor_at, *base_position_ms, *duration_ms)
+            };
+            let finished = position_ms >= *duration_ms;
+            (
+                playback_session_id.clone(),
+                recover_lock(&state.inner)
+                    .current_item
+                    .as_ref()
+                    .map(|item| item.id.clone())
+                    .unwrap_or_default(),
+                position_ms.min(*duration_ms),
+                *paused,
+                finished,
+            )
+        }
         ActivePlayback::Rodio {
+            playback_session_id,
             queue_item_id,
             player,
             ..
         } => {
             let finished = player.empty();
             (
+                playback_session_id.clone(),
+                queue_item_id.clone(),
                 player.get_pos().as_millis() as u64,
                 player.is_paused(),
-                finished.then(|| queue_item_id.clone()),
+                finished,
             )
         }
     };
@@ -418,15 +529,31 @@ fn poll_active_playback(state: &SharedPlaybackState, active: &mut Option<ActiveP
         let mut snapshot = recover_lock(&state.inner);
         snapshot.position_ms = position_ms;
         snapshot.paused = paused;
-        if let Some(finished_queue_item_id) = finished_queue_item_id.clone() {
-            snapshot.finished_queue_item_id = Some(finished_queue_item_id);
-            snapshot.paused = false;
-        }
     }
 
-    if finished_queue_item_id.is_some() {
+    let _ = event_tx.send(PlaybackWorkerEvent::Progress {
+        playback_session_id: playback_session_id.clone(),
+        position_ms,
+        paused,
+    });
+
+    if finished {
+        let _ = event_tx.send(PlaybackWorkerEvent::Ended {
+            playback_session_id,
+            queue_item_id,
+            position_ms,
+        });
+        clear_finished_playback(state, position_ms);
         *active = None;
     }
+}
+
+fn clear_finished_playback(state: &SharedPlaybackState, position_ms: u64) {
+    let mut snapshot = recover_lock(&state.inner);
+    snapshot.current_item = None;
+    snapshot.playback_session_id = None;
+    snapshot.position_ms = position_ms;
+    snapshot.paused = false;
 }
 
 fn clear_active_playback(
@@ -442,17 +569,23 @@ fn clear_active_playback(
 
     let mut snapshot = recover_lock(&state.inner);
     snapshot.current_item = None;
+    snapshot.playback_session_id = None;
     snapshot.position_ms = 0;
     snapshot.paused = false;
-    snapshot.finished_queue_item_id = None;
-    snapshot.start_status = PlaybackStartStatus::Idle;
     if record_stop {
         snapshot.history.push(PlaybackCommand::Stop);
     }
 }
 
+fn simulated_position_ms(anchor_at: Instant, base_position_ms: u64, duration_ms: u64) -> u64 {
+    base_position_ms
+        .saturating_add(anchor_at.elapsed().as_millis() as u64)
+        .min(duration_ms)
+}
+
 fn open_real_playback(
     item: &QueueItem,
+    playback_session_id: &str,
     position_ms: u64,
     playback_runtime: &mut Option<Runtime>,
     volume_percent: u8,
@@ -507,6 +640,7 @@ fn open_real_playback(
     }
 
     Ok(ActivePlayback::Rodio {
+        playback_session_id: playback_session_id.to_owned(),
         queue_item_id: item.id.clone(),
         _sink: sink,
         player,
@@ -767,9 +901,12 @@ mod tests {
     #[test]
     fn playback_commands_are_recorded() {
         let shared = SharedPlaybackState::default();
-        let mut adapter = LocalPlaybackAdapter::new(shared.clone());
+        let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut adapter = LocalPlaybackAdapter::new(shared.clone(), event_tx);
 
-        adapter.start(&queue_item("queue_item_1"), 0).unwrap();
+        adapter
+            .start(&queue_item("queue_item_1"), "playback_session_1", 0)
+            .unwrap();
         thread::sleep(Duration::from_millis(20));
         adapter.seek(42_000).unwrap();
         adapter.pause().unwrap();
@@ -779,18 +916,18 @@ mod tests {
         assert_eq!(snapshot.position_ms, 42_000);
         assert!(!snapshot.paused);
         assert_eq!(snapshot.history.len(), 4);
-        assert!(matches!(
-            snapshot.start_status,
-            PlaybackStartStatus::Ready { .. }
-        ));
+        assert_eq!(snapshot.playback_session_id.as_deref(), Some("playback_session_1"));
     }
 
     #[test]
     fn simulated_sources_can_be_stopped() {
         let shared = SharedPlaybackState::default();
-        let mut adapter = LocalPlaybackAdapter::new(shared.clone());
+        let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut adapter = LocalPlaybackAdapter::new(shared.clone(), event_tx);
 
-        adapter.start(&queue_item("queue_item_1"), 1_500).unwrap();
+        adapter
+            .start(&queue_item("queue_item_1"), "playback_session_1", 1_500)
+            .unwrap();
         thread::sleep(Duration::from_millis(20));
         adapter.stop().unwrap();
 
@@ -798,7 +935,70 @@ mod tests {
         assert!(snapshot.current_item.is_none());
         assert_eq!(snapshot.position_ms, 0);
         assert_eq!(snapshot.history.len(), 2);
-        assert_eq!(snapshot.start_status, PlaybackStartStatus::Idle);
+        assert_eq!(snapshot.playback_session_id, None);
+    }
+
+    #[test]
+    fn simulated_sources_honor_pause_resume_and_seek() {
+        let shared = SharedPlaybackState::default();
+        let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut adapter = LocalPlaybackAdapter::new(shared.clone(), event_tx);
+
+        adapter
+            .start(&queue_item("queue_item_1"), "playback_session_1", 0)
+            .unwrap();
+        thread::sleep(Duration::from_millis(300));
+        adapter.pause().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let paused_snapshot = shared.snapshot();
+        assert!(paused_snapshot.paused);
+        assert!(paused_snapshot.position_ms > 0);
+
+        thread::sleep(Duration::from_millis(300));
+        let still_paused_snapshot = shared.snapshot();
+        assert!(still_paused_snapshot.paused);
+        assert!(
+            still_paused_snapshot.position_ms.abs_diff(paused_snapshot.position_ms) <= 50,
+            "paused playback advanced too far: {} -> {}",
+            paused_snapshot.position_ms,
+            still_paused_snapshot.position_ms
+        );
+
+        adapter.seek(42_000).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let sought_snapshot = shared.snapshot();
+        assert_eq!(sought_snapshot.position_ms, 42_000);
+        assert!(sought_snapshot.paused);
+
+        thread::sleep(Duration::from_millis(300));
+        let still_sought_snapshot = shared.snapshot();
+        assert_eq!(still_sought_snapshot.position_ms, 42_000);
+
+        adapter.resume().unwrap();
+        thread::sleep(Duration::from_millis(300));
+        let resumed_snapshot = shared.snapshot();
+        assert!(!resumed_snapshot.paused);
+        assert!(resumed_snapshot.position_ms > 42_000);
+    }
+
+    #[test]
+    fn finished_simulated_sources_clear_shared_snapshot() {
+        let shared = SharedPlaybackState::default();
+        let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut adapter = LocalPlaybackAdapter::new(shared.clone(), event_tx);
+        let mut short_item = queue_item("queue_item_short");
+        short_item.song.duration_ms = 50;
+
+        adapter
+            .start(&short_item, "playback_session_1", 0)
+            .unwrap();
+        thread::sleep(Duration::from_millis(400));
+
+        let snapshot = shared.snapshot();
+        assert!(snapshot.current_item.is_none());
+        assert_eq!(snapshot.playback_session_id, None);
+        assert_eq!(snapshot.position_ms, 50);
+        assert!(!snapshot.paused);
     }
 
     #[test]
