@@ -118,6 +118,7 @@ impl App {
                 state: PlaybackStatus::Stopped,
                 position_ms: 0,
                 current_queue_item_id: None,
+                playback_session_id: None,
             },
             audio: AudioSettings::default(),
             current_song: None,
@@ -149,7 +150,8 @@ impl App {
         self.search_jobs = snapshot.search_jobs;
         self.last_event_id = current_event_id;
         self.sync_playback_anchor(self.playback.position_ms);
-        self.playback_progress_confirmed = self.playback.position_ms > 0;
+        self.playback_progress_confirmed =
+            self.playback.state == PlaybackStatus::Playing && self.playback.position_ms > 0;
         self.sync_current_song_from_queue();
         self.reconcile_queue_selection();
         self.set_status(
@@ -163,34 +165,32 @@ impl App {
         self.last_event_id = Some(event.event_id);
 
         match event.kind {
-            BackendEventKind::AudioSettingsChanged(payload) => {
-                self.audio = payload;
-            }
-            BackendEventKind::PlaybackStateChanged(payload) => {
-                self.playback.state = payload.state;
-                self.playback.current_queue_item_id = payload.current_queue_item_id;
-                self.playback.position_ms = payload.position_ms;
-                if self.playback.state != PlaybackStatus::Playing {
-                    self.sync_playback_anchor(payload.position_ms);
-                    self.playback_progress_confirmed = false;
-                }
+            BackendEventKind::StateUpdated(snapshot) => {
+                self.backend = snapshot.backend;
+                self.playback = snapshot.playback;
+                self.audio = snapshot.audio;
+                self.current_song = snapshot.current_song;
+                self.queue = snapshot.queue;
+                self.search_jobs = snapshot.search_jobs;
+                self.sync_playback_anchor(self.playback.position_ms);
+                self.playback_progress_confirmed =
+                    self.playback.state == PlaybackStatus::Playing && self.playback.position_ms > 0;
                 self.sync_current_song_from_queue();
+                self.reconcile_queue_selection();
+                self.reconcile_search_overlay_from_jobs();
             }
-            BackendEventKind::PlaybackTrackChanged(payload) => {
-                self.playback.current_queue_item_id = Some(payload.queue_item_id);
-                self.current_song = Some(payload.song);
-                self.sync_playback_anchor(0);
-                self.playback_progress_confirmed = false;
-            }
-            BackendEventKind::PlaybackPositionUpdated(payload) => {
+            BackendEventKind::PlaybackProgress(payload) => {
+                if self.playback.playback_session_id.is_none() {
+                    self.playback.playback_session_id = Some(payload.playback_session_id.clone());
+                }
+                if self.playback.playback_session_id.as_deref()
+                    != Some(payload.playback_session_id.as_str())
+                {
+                    return;
+                }
                 self.playback.position_ms = payload.position_ms;
                 self.playback_progress_confirmed = true;
                 self.sync_playback_anchor(payload.position_ms);
-            }
-            BackendEventKind::QueueUpdated(payload) => {
-                self.queue = payload.items;
-                self.sync_current_song_from_queue();
-                self.reconcile_queue_selection();
             }
             BackendEventKind::SearchJobStarted(job) => {
                 self.upsert_search_job(job.clone());
@@ -1294,6 +1294,7 @@ fn progress_bar(position_ms: u64, duration_ms: u64, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nocturne_api::PlaybackProgress;
 
     fn song(id: &str) -> Song {
         Song {
@@ -1535,6 +1536,7 @@ mod tests {
                     state: PlaybackStatus::Stopped,
                     position_ms: 0,
                     current_queue_item_id: None,
+                    playback_session_id: None,
                 },
                 audio: AudioSettings::default(),
                 current_song: None,
@@ -1547,6 +1549,7 @@ mod tests {
                     completed_at: Some(String::from("2026-04-24T00:00:05Z")),
                     result_count: None,
                 }],
+                revision: 1,
                 snapshot_id: String::from("snap_1"),
                 timestamp: String::from("2026-04-24T00:00:06Z"),
             },
@@ -1576,6 +1579,7 @@ mod tests {
                     state: PlaybackStatus::Stopped,
                     position_ms: 0,
                     current_queue_item_id: None,
+                    playback_session_id: None,
                 },
                 audio: AudioSettings::default(),
                 current_song: None,
@@ -1588,6 +1592,7 @@ mod tests {
                     completed_at: Some(String::from("2026-04-24T00:00:05Z")),
                     result_count: Some(2),
                 }],
+                revision: 1,
                 snapshot_id: String::from("snap_1"),
                 timestamp: String::from("2026-04-24T00:00:06Z"),
             },
@@ -1596,6 +1601,77 @@ mod tests {
 
         assert_eq!(app.take_search_results_request().as_deref(), Some("job_1"));
         assert_eq!(app.status_message, "Refreshing search results...");
+    }
+
+    #[test]
+    fn state_updated_syncs_current_song_from_queue() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+
+        app.apply_backend_event(BackendEvent {
+            event_id: String::from("evt_1"),
+            kind: BackendEventKind::StateUpdated(StateSnapshot {
+                backend: BackendStatus {
+                    ready: true,
+                    version: Some(String::from("test")),
+                },
+                playback: PlaybackState {
+                    state: PlaybackStatus::Playing,
+                    position_ms: 0,
+                    current_queue_item_id: Some(String::from("queue_item_1")),
+                    playback_session_id: Some(String::from("session_1")),
+                },
+                audio: AudioSettings::default(),
+                current_song: None,
+                queue: vec![queue_item("queue_item_1", QueueItemStatus::Playing)],
+                search_jobs: Vec::new(),
+                revision: 1,
+                snapshot_id: String::from("snap_1"),
+                timestamp: String::from("2026-04-24T00:00:06Z"),
+            }),
+        });
+
+        assert_eq!(
+            app.current_song.as_ref().map(|song| song.id.as_str()),
+            Some("queue_item_1")
+        );
+        assert!(!app.playback_progress_confirmed);
+    }
+
+    #[test]
+    fn playback_progress_adopts_missing_session_id() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.playback.state = PlaybackStatus::Playing;
+
+        app.apply_backend_event(BackendEvent {
+            event_id: String::from("evt_1"),
+            kind: BackendEventKind::PlaybackProgress(PlaybackProgress {
+                playback_session_id: String::from("session_1"),
+                position_ms: 1_234,
+            }),
+        });
+
+        assert_eq!(app.playback.playback_session_id.as_deref(), Some("session_1"));
+        assert_eq!(app.playback.position_ms, 1_234);
+        assert!(app.playback_progress_confirmed);
+    }
+
+    #[test]
+    fn playback_progress_ignores_mismatched_session_id() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.playback.playback_session_id = Some(String::from("session_1"));
+        app.playback.position_ms = 500;
+
+        app.apply_backend_event(BackendEvent {
+            event_id: String::from("evt_1"),
+            kind: BackendEventKind::PlaybackProgress(PlaybackProgress {
+                playback_session_id: String::from("session_2"),
+                position_ms: 1_234,
+            }),
+        });
+
+        assert_eq!(app.playback.playback_session_id.as_deref(), Some("session_1"));
+        assert_eq!(app.playback.position_ms, 500);
+        assert!(!app.playback_progress_confirmed);
     }
 
     #[test]

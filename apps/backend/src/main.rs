@@ -16,28 +16,27 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use nocturne_api::{
     ApiVersion, BackendStatus, CommandAccepted, EmptyPayload, EventEnvelope, EventName,
-    HealthResponse, PlaybackPositionUpdated, PlaybackSeekRequest, PlaybackStateChanged,
-    PlaybackTrackChanged, PlaybackVolumeRequest, ProblemDetails, QueueAddRequest, QueueMoveRequest,
-    QueueRemoveRequest, QueueResponse, QueueUpdateReason as ApiQueueUpdateReason, QueueUpdated,
-    SearchCommandRequest, SearchJobCompleted, SearchJobFailed,
-    SearchJobStatus as ApiSearchJobStatus, SearchJobSummary, SearchResultsResponse, StateSnapshot,
-    SystemError, SystemErrorSeverity,
+    HealthResponse, PlaybackProgress, PlaybackSeekRequest, PlaybackVolumeRequest, ProblemDetails,
+    QueueAddRequest, QueueMoveRequest, QueueRemoveRequest, QueueResponse, SearchCommandRequest,
+    SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus,
+    SearchJobSummary, SearchResultsResponse, StateSnapshot, SystemError, SystemErrorSeverity,
 };
 use nocturne_core::{
     CoreError, CoreEvent, CoreEventEnvelope, CoreSnapshot, NocturneCore, Orchestrator,
-    QueueUpdateReason as CoreQueueUpdateReason, SearchJobRecord,
-    SearchJobStatus as CoreSearchJobStatus, SystemErrorSeverity as CoreSystemErrorSeverity,
+    SearchJobRecord, SearchJobStatus as CoreSearchJobStatus,
+    SystemErrorSeverity as CoreSystemErrorSeverity,
 };
-use nocturne_domain::{AudioSettings, PlaybackStatus};
+use nocturne_domain::AudioSettings;
 use nocturne_infrastructure::{
     BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalAudioSettingsStore,
     LocalClock, LocalEventLog, LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter,
-    LocalSearchRuntime, PlaybackStartStatus, SharedPlaybackState,
+    LocalSearchRuntime, PlaybackWorkerEvent, SharedPlaybackState,
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use tokio::sync::broadcast;
+use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 type BackendOrchestrator = Orchestrator<
     LocalClock,
@@ -63,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_log = LocalEventLog::default();
     let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 128);
     let playback_state = SharedPlaybackState::default();
+    let (playback_event_tx, playback_event_rx) = mpsc::unbounded_channel();
     let search_runtime = LocalSearchRuntime::default();
     let settings_store = Arc::new(Mutex::new(LocalAudioSettingsStore::new()?));
     let initial_audio_settings = {
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LocalClock::new(),
         LocalIdGenerator::new(),
         event_publisher.clone(),
-        LocalPlaybackAdapter::new(playback_state.clone()),
+        LocalPlaybackAdapter::new(playback_state.clone(), playback_event_tx.clone()),
         LocalSearchAdapter::new(search_runtime.clone()),
     );
     orchestrator.set_backend_version(Some(env!("CARGO_PKG_VERSION")));
@@ -89,7 +89,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot = orchestrator.snapshot();
     let orchestrator = Arc::new(Mutex::new(orchestrator));
     spawn_search_worker(orchestrator.clone(), search_runtime.clone());
-    spawn_playback_monitor(orchestrator.clone(), playback_state.clone());
+    spawn_playback_event_bridge(orchestrator.clone(), playback_event_rx);
     let state = AppState {
         orchestrator,
         events: event_publisher.clone(),
@@ -133,26 +133,24 @@ fn spawn_search_worker(
     });
 }
 
-fn spawn_playback_monitor(
+fn spawn_playback_event_bridge(
     orchestrator: Arc<Mutex<BackendOrchestrator>>,
-    playback_state: SharedPlaybackState,
+    mut playback_events: mpsc::UnboundedReceiver<PlaybackWorkerEvent>,
 ) {
     tokio::spawn(async move {
-        let mut last_position = None;
-        let mut last_finished_queue_item_id = None;
-
         loop {
-            let snapshot = playback_state.snapshot();
-            let current_queue_item_id = snapshot.current_item.as_ref().map(|item| item.id.clone());
-
-            match &snapshot.start_status {
-                PlaybackStartStatus::Idle | PlaybackStartStatus::Pending { .. } => {}
-                PlaybackStartStatus::Ready {
+            match playback_events.recv().await {
+                Some(PlaybackWorkerEvent::Started {
+                    playback_session_id,
                     queue_item_id,
                     position_ms,
-                } => {
+                }) => {
                     let mut orchestrator = orchestrator.lock().await;
-                    match orchestrator.confirm_playback_started(queue_item_id, *position_ms) {
+                    match orchestrator.confirm_playback_started(
+                        &playback_session_id,
+                        &queue_item_id,
+                        position_ms,
+                    ) {
                         Ok(true) => {}
                         Ok(false) => {}
                         Err(error) => {
@@ -163,17 +161,21 @@ fn spawn_playback_monitor(
                         }
                     }
                 }
-                PlaybackStartStatus::Failed {
+                Some(PlaybackWorkerEvent::StartFailed {
+                    playback_session_id,
                     queue_item_id,
                     code,
                     message,
-                } => {
+                }) => {
                     let mut orchestrator = orchestrator.lock().await;
-                    match orchestrator.report_playback_start_failed(queue_item_id) {
+                    match orchestrator.report_playback_start_failed(
+                        &playback_session_id,
+                        &queue_item_id,
+                    ) {
                         Ok(true) => {
                             if let Err(error) = orchestrator.emit_system_error(
                                 code.clone(),
-                                user_message_for_playback_failure(code),
+                                user_message_for_playback_failure(&code),
                                 CoreSystemErrorSeverity::Error,
                             ) {
                                 eprintln!(
@@ -196,56 +198,39 @@ fn spawn_playback_monitor(
                         }
                     }
                 }
-            }
-
-            if current_queue_item_id.is_none() {
-                last_position = None;
-                last_finished_queue_item_id = None;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-
-            if let Some(finished_queue_item_id) = snapshot.finished_queue_item_id.clone() {
-                if last_finished_queue_item_id.as_deref() != Some(finished_queue_item_id.as_str()) {
+                Some(PlaybackWorkerEvent::Progress {
+                    playback_session_id,
+                    position_ms,
+                    paused,
+                }) => {
+                    if paused {
+                        continue;
+                    }
                     let mut orchestrator = orchestrator.lock().await;
-                    if orchestrator
-                        .state()
-                        .playback()
-                        .current_queue_item_id
-                        .as_deref()
-                        == Some(finished_queue_item_id.as_str())
-                        && let Err(error) = orchestrator.finish_current_track()
+                    if let Err(error) = orchestrator.report_playback_progress(&playback_session_id, position_ms)
+                    {
+                        eprintln!(
+                            "failed to publish playback progress {} for session {}: {error}",
+                            position_ms, playback_session_id
+                        );
+                    }
+                }
+                Some(PlaybackWorkerEvent::Ended {
+                    playback_session_id,
+                    queue_item_id,
+                    position_ms,
+                }) => {
+                    let mut orchestrator = orchestrator.lock().await;
+                    if let Err(error) = orchestrator.finish_current_track(&playback_session_id, position_ms)
                     {
                         eprintln!(
                             "failed to advance playback after natural track end {}: {error}",
-                            finished_queue_item_id
+                            queue_item_id
                         );
                     }
-                    last_finished_queue_item_id = Some(finished_queue_item_id);
-                    last_position = None;
                 }
-            } else if !snapshot.paused && Some(snapshot.position_ms) != last_position {
-                let mut orchestrator = orchestrator.lock().await;
-                if orchestrator.state().playback().state == PlaybackStatus::Playing
-                    && orchestrator
-                        .state()
-                        .playback()
-                        .current_queue_item_id
-                        .as_deref()
-                        == current_queue_item_id.as_deref()
-                {
-                    if let Err(error) = orchestrator.note_position(snapshot.position_ms) {
-                        eprintln!(
-                            "failed to publish playback position {}ms for {:?}: {error}",
-                            snapshot.position_ms, current_queue_item_id
-                        );
-                    } else {
-                        last_position = Some(snapshot.position_ms);
-                    }
-                }
+                None => break,
             }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     });
 }
@@ -784,6 +769,7 @@ fn map_state_snapshot(snapshot: CoreSnapshot) -> StateSnapshot {
             .into_iter()
             .map(map_search_job_summary)
             .collect(),
+        revision: snapshot.revision,
         snapshot_id: snapshot.snapshot_id,
         timestamp: snapshot.timestamp,
     }
@@ -803,41 +789,18 @@ fn map_event_envelope(core: CoreEventEnvelope<CoreEvent>) -> EventEnvelope<Value
 
 fn map_server_event(core: CoreEvent) -> (EventName, Value) {
     match core {
-        CoreEvent::PlaybackStateChanged(event) => (
-            EventName::PlaybackStateChanged,
-            serde_json::to_value(PlaybackStateChanged {
-                state: event.state,
-                current_queue_item_id: event.current_queue_item_id,
+        CoreEvent::StateUpdated(event) => (
+            EventName::StateUpdated,
+            serde_json::to_value(map_state_snapshot(event.snapshot))
+                .expect("state updated event should serialize"),
+        ),
+        CoreEvent::PlaybackProgress(event) => (
+            EventName::PlaybackProgress,
+            serde_json::to_value(PlaybackProgress {
+                playback_session_id: event.playback_session_id,
                 position_ms: event.position_ms,
             })
-            .expect("playback state event should serialize"),
-        ),
-        CoreEvent::AudioSettingsChanged(event) => (
-            EventName::AudioSettingsChanged,
-            serde_json::to_value(event).expect("audio settings event should serialize"),
-        ),
-        CoreEvent::PlaybackTrackChanged(event) => (
-            EventName::PlaybackTrackChanged,
-            serde_json::to_value(PlaybackTrackChanged {
-                queue_item_id: event.queue_item_id,
-                song: event.song,
-            })
-            .expect("track changed event should serialize"),
-        ),
-        CoreEvent::PlaybackPositionUpdated(event) => (
-            EventName::PlaybackPositionUpdated,
-            serde_json::to_value(PlaybackPositionUpdated {
-                position_ms: event.position_ms,
-            })
-            .expect("position event should serialize"),
-        ),
-        CoreEvent::QueueUpdated(event) => (
-            EventName::QueueUpdated,
-            serde_json::to_value(QueueUpdated {
-                reason: map_queue_update_reason(event.reason),
-                items: event.items,
-            })
-            .expect("queue updated event should serialize"),
+            .expect("playback progress event should serialize"),
         ),
         CoreEvent::SearchJobStarted(job) => (
             EventName::SearchJobStarted,
@@ -906,16 +869,6 @@ fn map_search_job_status(status: CoreSearchJobStatus) -> ApiSearchJobStatus {
         CoreSearchJobStatus::Running => ApiSearchJobStatus::Running,
         CoreSearchJobStatus::Completed => ApiSearchJobStatus::Completed,
         CoreSearchJobStatus::Failed => ApiSearchJobStatus::Failed,
-    }
-}
-
-fn map_queue_update_reason(reason: CoreQueueUpdateReason) -> ApiQueueUpdateReason {
-    match reason {
-        CoreQueueUpdateReason::Add => ApiQueueUpdateReason::Add,
-        CoreQueueUpdateReason::Remove => ApiQueueUpdateReason::Remove,
-        CoreQueueUpdateReason::Move => ApiQueueUpdateReason::Move,
-        CoreQueueUpdateReason::Clear => ApiQueueUpdateReason::Clear,
-        CoreQueueUpdateReason::CurrentChanged => ApiQueueUpdateReason::CurrentChanged,
     }
 }
 
@@ -1072,6 +1025,20 @@ mod tests {
 
     static TEST_SETTINGS_STORE_ID: AtomicU64 = AtomicU64::new(0);
 
+    fn test_playback_adapter() -> LocalPlaybackAdapter {
+        let (event_tx, _) = mpsc::unbounded_channel();
+        LocalPlaybackAdapter::new(SharedPlaybackState::default(), event_tx)
+    }
+
+    fn current_session_id(orchestrator: &BackendOrchestrator) -> String {
+        orchestrator
+            .state()
+            .playback()
+            .playback_session_id
+            .clone()
+            .expect("expected playback session id")
+    }
+
     fn test_settings_store() -> Arc<Mutex<LocalAudioSettingsStore>> {
         let store_id = TEST_SETTINGS_STORE_ID.fetch_add(1, Ordering::Relaxed);
         Arc::new(Mutex::new(LocalAudioSettingsStore::from_path(
@@ -1089,7 +1056,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
         orchestrator
@@ -1220,7 +1187,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
         let app = app_router(AppState {
@@ -1267,7 +1234,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
         let app = app_router(AppState {
@@ -1314,7 +1281,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher,
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(search_runtime.clone()),
         )));
 
@@ -1452,7 +1419,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(search_runtime.clone()),
         )));
         let state = AppState {
@@ -1504,7 +1471,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(search_runtime.clone()),
         )));
 
@@ -1529,7 +1496,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher,
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
 
@@ -1578,7 +1545,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(search_runtime.clone()),
         )));
 
@@ -1673,7 +1640,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
         let song = Song {
@@ -1688,8 +1655,9 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
+        let playback_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started(&queue_item_id, 0)
+            .confirm_playback_started(&playback_session_id, &queue_item_id, 0)
             .unwrap();
 
         let app = app_router(AppState {
@@ -1729,7 +1697,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
         orchestrator
@@ -1752,8 +1720,9 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
+        let playback_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started("queue_item_0001", 0)
+            .confirm_playback_started(&playback_session_id, "queue_item_0001", 0)
             .unwrap();
         orchestrator.stop().unwrap();
 
@@ -1807,7 +1776,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
         orchestrator
@@ -1863,7 +1832,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
         orchestrator
@@ -1920,7 +1889,7 @@ mod tests {
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
-            LocalPlaybackAdapter::new(SharedPlaybackState::default()),
+            test_playback_adapter(),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
         orchestrator
@@ -1932,8 +1901,9 @@ mod tests {
                 source_url: String::from("https://example.com/a"),
             })
             .unwrap();
+        let playback_session_id = current_session_id(&orchestrator);
         orchestrator
-            .confirm_playback_started("queue_item_0001", 0)
+            .confirm_playback_started(&playback_session_id, "queue_item_0001", 0)
             .unwrap();
 
         let app = app_router(AppState {

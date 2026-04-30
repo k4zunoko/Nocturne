@@ -10,12 +10,10 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use nocturne_api::{
     CURRENT_EVENT_ID_HEADER, CommandAccepted, EVENTS_PATH, EmptyPayload, EventEnvelope,
-    HEALTH_PATH, LAST_EVENT_ID_HEADER, PlaybackPositionUpdated, PlaybackStateChanged,
-    PlaybackTrackChanged, PlaybackVolumeRequest, ProblemDetails, QueueAddRequest,
-    QueueRemoveRequest, QueueUpdated, STATE_PATH, SearchCommandRequest, SearchJobCompleted,
+    HEALTH_PATH, LAST_EVENT_ID_HEADER, PlaybackProgress, PlaybackVolumeRequest, ProblemDetails,
+    QueueAddRequest, QueueRemoveRequest, STATE_PATH, SearchCommandRequest, SearchJobCompleted,
     SearchJobFailed, SearchJobSummary, SearchResultsResponse, StateSnapshot, SystemError,
 };
-use nocturne_domain::AudioSettings;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
@@ -63,11 +61,8 @@ pub struct BackendEvent {
 
 #[derive(Debug, Clone)]
 pub enum BackendEventKind {
-    PlaybackStateChanged(PlaybackStateChanged),
-    AudioSettingsChanged(AudioSettings),
-    PlaybackTrackChanged(PlaybackTrackChanged),
-    PlaybackPositionUpdated(PlaybackPositionUpdated),
-    QueueUpdated(QueueUpdated),
+    StateUpdated(StateSnapshot),
+    PlaybackProgress(PlaybackProgress),
     SearchJobStarted(SearchJobSummary),
     SearchJobCompleted(SearchJobCompleted),
     SearchJobFailed(SearchJobFailed),
@@ -474,32 +469,15 @@ pub fn spawn_search_results_task(
 
 fn decode_backend_event(envelope: EventEnvelope<Value>) -> Result<Option<BackendEvent>, TuiError> {
     let event_id = envelope.event_id;
-    let kind = match envelope.event.as_str() {
-        "audio.settings.changed" => BackendEventKind::AudioSettingsChanged(
-            serde_json::from_value::<AudioSettings>(envelope.data).map_err(|error| {
-                TuiError::new(format!("failed to decode audio.settings.changed: {error}"))
+        let kind = match envelope.event.as_str() {
+        "state.updated" => BackendEventKind::StateUpdated(
+            serde_json::from_value::<StateSnapshot>(envelope.data).map_err(|error| {
+                TuiError::new(format!("failed to decode state.updated: {error}"))
             })?,
         ),
-        "playback.state.changed" => BackendEventKind::PlaybackStateChanged(
-            serde_json::from_value::<PlaybackStateChanged>(envelope.data).map_err(|error| {
-                TuiError::new(format!("failed to decode playback.state.changed: {error}"))
-            })?,
-        ),
-        "playback.track.changed" => BackendEventKind::PlaybackTrackChanged(
-            serde_json::from_value::<PlaybackTrackChanged>(envelope.data).map_err(|error| {
-                TuiError::new(format!("failed to decode playback.track.changed: {error}"))
-            })?,
-        ),
-        "playback.position.updated" => BackendEventKind::PlaybackPositionUpdated(
-            serde_json::from_value::<PlaybackPositionUpdated>(envelope.data).map_err(|error| {
-                TuiError::new(format!(
-                    "failed to decode playback.position.updated: {error}"
-                ))
-            })?,
-        ),
-        "queue.updated" => BackendEventKind::QueueUpdated(
-            serde_json::from_value::<QueueUpdated>(envelope.data).map_err(|error| {
-                TuiError::new(format!("failed to decode queue.updated: {error}"))
+        "playback.progress" => BackendEventKind::PlaybackProgress(
+            serde_json::from_value::<PlaybackProgress>(envelope.data).map_err(|error| {
+                TuiError::new(format!("failed to decode playback.progress: {error}"))
             })?,
         ),
         "search.job.started" => BackendEventKind::SearchJobStarted(
@@ -615,7 +593,7 @@ mod tests {
     use axum::http::{HeaderMap as AxumHeaderMap, StatusCode};
     use axum::{Json, Router, routing::get};
     use nocturne_api::{BackendStatus, ProblemDetails};
-    use nocturne_domain::{PlaybackState, PlaybackStatus};
+    use nocturne_domain::{AudioSettings, PlaybackState, PlaybackStatus};
     use tokio::net::TcpListener as TokioTcpListener;
     use tokio::sync::{Mutex, oneshot};
 
@@ -691,11 +669,13 @@ mod tests {
                     state: PlaybackStatus::Paused,
                     position_ms: 42_000,
                     current_queue_item_id: None,
+                    playback_session_id: None,
                 },
                 audio: AudioSettings::default(),
                 current_song: None,
                 queue: Vec::new(),
                 search_jobs: Vec::new(),
+                revision: 1,
                 snapshot_id: String::from("snap_refresh"),
                 timestamp: String::from("2026-04-24T09:00:00Z"),
             }),
