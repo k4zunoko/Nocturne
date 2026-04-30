@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::env;
+use std::io::BufReader;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
@@ -9,6 +11,7 @@ use std::time::{Duration, Instant};
 use nocturne_core::{PlaybackPort, PortError};
 use nocturne_domain::{AudioSettings, QueueItem};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
+use stream_download::process::{ProcessStreamParams, YtDlpCommand};
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
 use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
@@ -20,8 +23,12 @@ const DEFAULT_YT_DLP_BINARY: &str = "yt-dlp";
 const DEFAULT_WINDOWS_YT_DLP_PATH: &str = r"C:\tools\yt-dlp\yt-dlp.exe";
 const YT_DLP_PATH_ENV: &str = "NOCTURNE_YT_DLP_PATH";
 const YT_DLP_AUDIO_FORMAT: &str = "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
+const YT_DLP_PROCESS_AUDIO_FORMAT: &str = "140/139";
 const YT_DLP_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PLAYBACK_URL_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const PLAYBACK_URL_CACHE_LIMIT: usize = 64;
+const PLAYBACK_STREAM_PREFETCH_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlaybackCommand {
@@ -234,6 +241,12 @@ enum ActivePlayback {
     },
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedPlaybackUrl {
+    playback_url: String,
+    resolved_at: Instant,
+}
+
 fn playback_worker_loop(
     receiver: mpsc::Receiver<WorkerCommand>,
     state: SharedPlaybackState,
@@ -241,6 +254,7 @@ fn playback_worker_loop(
 ) {
     let mut active = None;
     let mut playback_runtime = None;
+    let mut resolved_playback_urls = HashMap::new();
     let mut volume_percent = AudioSettings::DEFAULT_VOLUME_PERCENT;
 
     loop {
@@ -254,6 +268,7 @@ fn playback_worker_loop(
                     &state,
                     &mut active,
                     &mut playback_runtime,
+                    &mut resolved_playback_urls,
                     &event_tx,
                     item,
                     playback_session_id,
@@ -293,6 +308,7 @@ fn handle_start(
     state: &SharedPlaybackState,
     active: &mut Option<ActivePlayback>,
     playback_runtime: &mut Option<Runtime>,
+    resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
     event_tx: &UnboundedSender<PlaybackWorkerEvent>,
     item: QueueItem,
     playback_session_id: String,
@@ -300,6 +316,7 @@ fn handle_start(
     volume_percent: u8,
 ) {
     clear_active_playback(state, active, false);
+    let load_started_at = Instant::now();
 
     let next_active = if should_simulate_source(&item.song.source_url) {
         ActivePlayback::Simulated {
@@ -315,10 +332,18 @@ fn handle_start(
             &playback_session_id,
             position_ms,
             playback_runtime,
+            resolved_playback_urls,
             volume_percent,
         ) {
             Ok(active_playback) => active_playback,
             Err(error) => {
+                eprintln!(
+                    "[nocturne][playback] start failed queue_item_id={} session_id={} elapsed_ms={} code={}",
+                    item.id,
+                    playback_session_id,
+                    load_started_at.elapsed().as_millis(),
+                    error.code(),
+                );
                 let mut snapshot = recover_lock(&state.inner);
                 snapshot.current_item = None;
                 snapshot.playback_session_id = None;
@@ -354,6 +379,12 @@ fn handle_start(
         queue_item_id: item.id.clone(),
         position_ms,
     });
+
+    eprintln!(
+        "[nocturne][playback] start completed queue_item_id={} elapsed_ms={}",
+        item.id,
+        load_started_at.elapsed().as_millis(),
+    );
 
     *active = Some(next_active);
 }
@@ -588,46 +619,91 @@ fn open_real_playback(
     playback_session_id: &str,
     position_ms: u64,
     playback_runtime: &mut Option<Runtime>,
+    resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
     volume_percent: u8,
 ) -> Result<ActivePlayback, PortError> {
+    let audio_output_started_at = Instant::now();
     let sink = DeviceSinkBuilder::open_default_sink().map_err(|error| {
         PortError::new(
             "audio_output_unavailable",
             format!("failed to open the default audio output device: {error}"),
         )
     })?;
+    let audio_output_elapsed_ms = audio_output_started_at.elapsed().as_millis();
+
+    let player_started_at = Instant::now();
     let player = Player::connect_new(sink.mixer());
+    let player_elapsed_ms = player_started_at.elapsed().as_millis();
 
-    let playback_url = resolve_playback_url(&item.song.source_url)?;
+    let runtime_started_at = Instant::now();
     let runtime = playback_runtime_instance(playback_runtime)?;
+    let runtime_elapsed_ms = runtime_started_at.elapsed().as_millis();
 
-    let reader = runtime.block_on(async {
-        let stream_url = playback_url.parse().map_err(|error| {
-            PortError::new(
-                "playback_url_invalid",
-                format!("playback URL could not be parsed: {error}"),
+    let (playback_url, reader, resolve_elapsed_ms, stream_open_elapsed_ms) =
+        if is_youtube_url(&item.song.source_url) {
+            let stream_open_started_at = Instant::now();
+            match runtime.block_on(open_youtube_playback_stream(&item.song.source_url)) {
+                Ok(reader) => (
+                    String::from("https://youtube.local/audio.m4a?mime=audio%2Fmp4"),
+                    reader,
+                    0,
+                    stream_open_started_at.elapsed().as_millis(),
+                ),
+                Err(_) => {
+                    let resolve_started_at = Instant::now();
+                    let playback_url =
+                        resolve_playback_url(&item.song.source_url, resolved_playback_urls)?;
+                    let resolve_elapsed_ms = resolve_started_at.elapsed().as_millis();
+                    let stream_open_started_at = Instant::now();
+                    let reader = runtime.block_on(open_http_playback_stream(&playback_url))?;
+                    (
+                        playback_url,
+                        reader,
+                        resolve_elapsed_ms,
+                        stream_open_started_at.elapsed().as_millis(),
+                    )
+                }
+            }
+        } else {
+            let playback_url = resolve_playback_url(&item.song.source_url, resolved_playback_urls)?;
+            let stream_open_started_at = Instant::now();
+            let reader = runtime.block_on(open_http_playback_stream(&playback_url))?;
+            (
+                playback_url,
+                reader,
+                0,
+                stream_open_started_at.elapsed().as_millis(),
             )
-        })?;
+        };
 
-        StreamDownload::new_http(stream_url, TempStorageProvider::new(), Settings::default())
-            .await
-            .map_err(|error| {
-                PortError::new(
-                    "playback_stream_open_failed",
-                    format!("failed to open the playback stream: {error}"),
-                )
-            })
-    })?;
-
-    let decoder = Decoder::new(reader).map_err(|error| {
+    let byte_len = reader.content_length();
+    let decoder_preferences = infer_decoder_preferences(&playback_url);
+    let decode_started_at = Instant::now();
+    let mut decoder_builder = Decoder::builder().with_data(BufReader::new(reader));
+    if let Some(byte_len) = byte_len {
+        decoder_builder = decoder_builder.with_byte_len(byte_len);
+        decoder_builder = decoder_builder.with_seekable(true);
+    }
+    if let Some(format_hint) = decoder_preferences.format_hint {
+        decoder_builder = decoder_builder.with_hint(format_hint);
+    }
+    if let Some(mime_type) = decoder_preferences.mime_type {
+        decoder_builder = decoder_builder.with_mime_type(mime_type);
+    }
+    let decoder = decoder_builder.build().map_err(|error| {
         PortError::new(
             "playback_decode_failed",
             format!("failed to decode the playback stream: {error}"),
         )
     })?;
+    let decode_elapsed_ms = decode_started_at.elapsed().as_millis();
+
+    let append_started_at = Instant::now();
     player.append(decoder);
     player.set_volume(percent_to_gain(volume_percent));
+    let append_elapsed_ms = append_started_at.elapsed().as_millis();
 
+    let seek_started_at = Instant::now();
     if position_ms > 0 {
         player
             .try_seek(Duration::from_millis(position_ms))
@@ -638,6 +714,22 @@ fn open_real_playback(
                 )
             })?;
     }
+    let seek_elapsed_ms = seek_started_at.elapsed().as_millis();
+
+    eprintln!(
+        "[nocturne][playback] open_real_playback queue_item_id={} session_id={} output_ms={} player_ms={} resolve_ms={} runtime_ms={} stream_open_ms={} decode_ms={} append_ms={} seek_ms={} total_ms={}",
+        item.id,
+        playback_session_id,
+        audio_output_elapsed_ms,
+        player_elapsed_ms,
+        resolve_elapsed_ms,
+        runtime_elapsed_ms,
+        stream_open_elapsed_ms,
+        decode_elapsed_ms,
+        append_elapsed_ms,
+        seek_elapsed_ms,
+        audio_output_started_at.elapsed().as_millis(),
+    );
 
     Ok(ActivePlayback::Rodio {
         playback_session_id: playback_session_id.to_owned(),
@@ -670,12 +762,120 @@ fn playback_runtime_instance(
         .expect("playback runtime should be initialized"))
 }
 
-fn resolve_playback_url(source_url: &str) -> Result<String, PortError> {
+async fn open_http_playback_stream(
+    playback_url: &str,
+) -> Result<StreamDownload<TempStorageProvider>, PortError> {
+    let stream_url = playback_url.parse().map_err(|error| {
+        PortError::new(
+            "playback_url_invalid",
+            format!("playback URL could not be parsed: {error}"),
+        )
+    })?;
+
+    StreamDownload::new_http(
+        stream_url,
+        TempStorageProvider::new(),
+        Settings::default().prefetch_bytes(PLAYBACK_STREAM_PREFETCH_BYTES),
+    )
+    .await
+    .map_err(|error| {
+        PortError::new(
+            "playback_stream_open_failed",
+            format!("failed to open the playback stream: {error}"),
+        )
+    })
+}
+
+async fn open_youtube_playback_stream(
+    source_url: &str,
+) -> Result<StreamDownload<TempStorageProvider>, PortError> {
+    let process_params = build_youtube_process_stream_params(source_url)?;
+
+    StreamDownload::new_process(
+        process_params,
+        TempStorageProvider::new(),
+        Settings::default().prefetch_bytes(PLAYBACK_STREAM_PREFETCH_BYTES),
+    )
+    .await
+    .map_err(|error| {
+        PortError::new(
+            "playback_stream_open_failed",
+            format!("failed to open the playback stream: {error}"),
+        )
+    })
+}
+
+fn build_youtube_process_stream_params(
+    source_url: &str,
+) -> Result<ProcessStreamParams, PortError> {
+    let command = YtDlpCommand::new(source_url)
+        .yt_dlp_path(yt_dlp_executable())
+        .extract_audio(true)
+        .format(YT_DLP_PROCESS_AUDIO_FORMAT);
+    let params = ProcessStreamParams::new(command).map_err(|error| {
+        PortError::new(
+            "yt_dlp_spawn_failed",
+            format!("failed to spawn yt-dlp playback stream: {error}"),
+        )
+    })?;
+
+    Ok(params)
+}
+
+fn resolve_playback_url(
+    source_url: &str,
+    resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
+) -> Result<String, PortError> {
     if is_youtube_url(source_url) {
-        resolve_youtube_playback_url(source_url)
+        if let Some(playback_url) = cached_playback_url(source_url, resolved_playback_urls) {
+            return Ok(playback_url);
+        }
+
+        let playback_url = resolve_youtube_playback_url(source_url)?;
+        insert_cached_playback_url(source_url, playback_url.clone(), resolved_playback_urls);
+        Ok(playback_url)
     } else {
         Ok(source_url.to_owned())
     }
+}
+
+fn cached_playback_url(
+    source_url: &str,
+    resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
+) -> Option<String> {
+    prune_cached_playback_urls(resolved_playback_urls);
+    resolved_playback_urls
+        .get(source_url)
+        .map(|cached| cached.playback_url.clone())
+}
+
+fn insert_cached_playback_url(
+    source_url: &str,
+    playback_url: String,
+    resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
+) {
+    prune_cached_playback_urls(resolved_playback_urls);
+
+    if resolved_playback_urls.len() >= PLAYBACK_URL_CACHE_LIMIT
+        && let Some(oldest_key) = resolved_playback_urls
+            .iter()
+            .min_by_key(|(_, cached)| cached.resolved_at)
+            .map(|(key, _)| key.clone())
+    {
+        resolved_playback_urls.remove(&oldest_key);
+    }
+
+    resolved_playback_urls.insert(
+        source_url.to_owned(),
+        ResolvedPlaybackUrl {
+            playback_url,
+            resolved_at: Instant::now(),
+        },
+    );
+}
+
+fn prune_cached_playback_urls(resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>) {
+    resolved_playback_urls.retain(|_, cached| cached.resolved_at.elapsed() <= PLAYBACK_URL_CACHE_TTL);
 }
 
 fn resolve_youtube_playback_url(source_url: &str) -> Result<String, PortError> {
@@ -830,6 +1030,68 @@ fn first_non_empty_line(stdout: &[u8]) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(str::to_owned)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DecoderPreferences {
+    format_hint: Option<&'static str>,
+    mime_type: Option<&'static str>,
+}
+
+fn infer_decoder_preferences(playback_url: &str) -> DecoderPreferences {
+    let normalized = playback_url.trim().to_ascii_lowercase();
+
+    if normalized.contains("mime=audio%2fmpeg")
+        || normalized.contains("mime=audio/mpeg")
+        || normalized.contains(".mp3")
+    {
+        return DecoderPreferences {
+            format_hint: Some("mp3"),
+            mime_type: Some("audio/mpeg"),
+        };
+    }
+
+    if normalized.contains("mime=audio%2fogg")
+        || normalized.contains("mime=audio/ogg")
+        || normalized.contains(".ogg")
+    {
+        return DecoderPreferences {
+            format_hint: Some("ogg"),
+            mime_type: Some("audio/ogg"),
+        };
+    }
+
+    if normalized.contains("mime=audio%2fflac")
+        || normalized.contains("mime=audio/flac")
+        || normalized.contains(".flac")
+    {
+        return DecoderPreferences {
+            format_hint: Some("flac"),
+            mime_type: Some("audio/flac"),
+        };
+    }
+
+    if normalized.contains("mime=audio%2fwav")
+        || normalized.contains("mime=audio/wav")
+        || normalized.contains(".wav")
+    {
+        return DecoderPreferences {
+            format_hint: Some("wav"),
+            mime_type: Some("audio/wav"),
+        };
+    }
+
+    if normalized.contains("mime=audio%2fmp4") || normalized.contains("mime=audio/mp4") {
+        return DecoderPreferences {
+            format_hint: None,
+            mime_type: Some("audio/mp4"),
+        };
+    }
+
+    DecoderPreferences {
+        format_hint: None,
+        mime_type: None,
+    }
 }
 
 fn should_simulate_source(source_url: &str) -> bool {
@@ -1025,6 +1287,24 @@ mod tests {
             YT_DLP_AUDIO_FORMAT,
             "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best"
         );
+    }
+
+    #[test]
+    fn infer_decoder_preferences_recognizes_mp3_streams() {
+        let preferences = infer_decoder_preferences("https://example.com/audio.mp3?mime=audio%2Fmpeg");
+
+        assert_eq!(preferences.format_hint, Some("mp3"));
+        assert_eq!(preferences.mime_type, Some("audio/mpeg"));
+    }
+
+    #[test]
+    fn infer_decoder_preferences_recognizes_mp4_audio_streams() {
+        let preferences = infer_decoder_preferences(
+            "https://example.com/videoplayback?mime=audio%2Fmp4&itag=140",
+        );
+
+        assert_eq!(preferences.format_hint, None);
+        assert_eq!(preferences.mime_type, Some("audio/mp4"));
     }
 
     #[test]

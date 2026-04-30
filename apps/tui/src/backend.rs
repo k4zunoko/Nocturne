@@ -116,7 +116,7 @@ impl ManagedBackend {
             .env("NOCTURNE_BACKEND_ADDR", addr.to_string())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(configured_backend_stderr())
             .spawn()
             .map_err(|error| TuiError::new(format!("failed to launch backend: {error}")))?;
 
@@ -165,6 +165,15 @@ impl ManagedBackend {
     pub fn shutdown(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+fn configured_backend_stderr() -> Stdio {
+    match env::var("NOCTURNE_BACKEND_STDERR") {
+        Ok(value) if matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "inherit") => {
+            Stdio::inherit()
+        }
+        _ => Stdio::null(),
     }
 }
 
