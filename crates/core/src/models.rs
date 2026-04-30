@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use nocturne_domain::{PlaybackState, PlaybackStatus, QueueItem, Song};
+use nocturne_domain::{AudioSettings, PlaybackState, PlaybackStatus, QueueItem, Song};
 
 pub type CoreId = String;
 pub type CoreTimestamp = String;
@@ -39,6 +39,7 @@ pub struct SearchResultsRecord {
 pub struct CoreSnapshot {
     pub backend: BackendState,
     pub playback: PlaybackState,
+    pub audio: AudioSettings,
     pub current_song: Option<Song>,
     pub queue: Vec<QueueItem>,
     pub search_jobs: Vec<SearchJobRecord>,
@@ -116,6 +117,7 @@ pub struct SystemErrorEvent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreEvent {
     PlaybackStateChanged(PlaybackStateChangedEvent),
+    AudioSettingsChanged(AudioSettings),
     PlaybackTrackChanged(PlaybackTrackChangedEvent),
     PlaybackPositionUpdated(PlaybackPositionUpdatedEvent),
     QueueUpdated(QueueUpdatedEvent),
@@ -128,6 +130,7 @@ pub enum CoreEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreEventKind {
     PlaybackStateChanged,
+    AudioSettingsChanged,
     PlaybackTrackChanged,
     PlaybackPositionUpdated,
     QueueUpdated,
@@ -141,6 +144,7 @@ impl Display for CoreEventKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::PlaybackStateChanged => "playback.state.changed",
+            Self::AudioSettingsChanged => "audio.settings.changed",
             Self::PlaybackTrackChanged => "playback.track.changed",
             Self::PlaybackPositionUpdated => "playback.position.updated",
             Self::QueueUpdated => "queue.updated",
