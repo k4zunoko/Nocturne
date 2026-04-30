@@ -17,21 +17,22 @@ use axum::{Json, Router};
 use nocturne_api::{
     ApiVersion, BackendStatus, CommandAccepted, EmptyPayload, EventEnvelope, EventName,
     HealthResponse, PlaybackPositionUpdated, PlaybackSeekRequest, PlaybackStateChanged,
-    PlaybackTrackChanged, ProblemDetails, QueueAddRequest, QueueMoveRequest, QueueRemoveRequest,
-    QueueResponse, QueueUpdateReason as ApiQueueUpdateReason, QueueUpdated, SearchCommandRequest,
-    SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus, SearchJobSummary,
-    SearchResultsResponse, StateSnapshot, SystemError, SystemErrorSeverity,
+    PlaybackTrackChanged, PlaybackVolumeRequest, ProblemDetails, QueueAddRequest, QueueMoveRequest,
+    QueueRemoveRequest, QueueResponse, QueueUpdateReason as ApiQueueUpdateReason, QueueUpdated,
+    SearchCommandRequest, SearchJobCompleted, SearchJobFailed,
+    SearchJobStatus as ApiSearchJobStatus, SearchJobSummary, SearchResultsResponse, StateSnapshot,
+    SystemError, SystemErrorSeverity,
 };
 use nocturne_core::{
     CoreError, CoreEvent, CoreEventEnvelope, CoreSnapshot, NocturneCore, Orchestrator,
     QueueUpdateReason as CoreQueueUpdateReason, SearchJobRecord,
     SearchJobStatus as CoreSearchJobStatus, SystemErrorSeverity as CoreSystemErrorSeverity,
 };
-use nocturne_domain::PlaybackStatus;
+use nocturne_domain::{AudioSettings, PlaybackStatus};
 use nocturne_infrastructure::{
-    BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalClock, LocalEventLog,
-    LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter, LocalSearchRuntime,
-    PlaybackStartStatus, SharedPlaybackState,
+    BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalAudioSettingsStore,
+    LocalClock, LocalEventLog, LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter,
+    LocalSearchRuntime, PlaybackStartStatus, SharedPlaybackState,
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -53,6 +54,7 @@ const CURRENT_EVENT_ID_HEADER: HeaderName =
 struct AppState {
     orchestrator: Arc<Mutex<BackendOrchestrator>>,
     events: BroadcastEventPublisher,
+    settings_store: Arc<Mutex<LocalAudioSettingsStore>>,
 }
 
 #[tokio::main]
@@ -62,6 +64,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 128);
     let playback_state = SharedPlaybackState::default();
     let search_runtime = LocalSearchRuntime::default();
+    let settings_store = Arc::new(Mutex::new(LocalAudioSettingsStore::new()?));
+    let initial_audio_settings = {
+        let store = settings_store.lock().await;
+        match store.load() {
+            Ok(settings) => settings,
+            Err(error) => {
+                eprintln!("failed to load audio settings, falling back to defaults: {error}");
+                AudioSettings::default()
+            }
+        }
+    };
 
     let mut orchestrator = Orchestrator::new(
         LocalClock::new(),
@@ -71,6 +84,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LocalSearchAdapter::new(search_runtime.clone()),
     );
     orchestrator.set_backend_version(Some(env!("CARGO_PKG_VERSION")));
+    orchestrator.hydrate_audio_settings(initial_audio_settings)?;
 
     let snapshot = orchestrator.snapshot();
     let orchestrator = Arc::new(Mutex::new(orchestrator));
@@ -79,6 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = AppState {
         orchestrator,
         events: event_publisher.clone(),
+        settings_store,
     };
     let app = app_router(state.clone());
 
@@ -168,8 +183,7 @@ fn spawn_playback_monitor(
                             } else {
                                 eprintln!(
                                     "playback start failed for {}: {}",
-                                    queue_item_id,
-                                    message
+                                    queue_item_id, message
                                 );
                             }
                         }
@@ -194,7 +208,11 @@ fn spawn_playback_monitor(
             if let Some(finished_queue_item_id) = snapshot.finished_queue_item_id.clone() {
                 if last_finished_queue_item_id.as_deref() != Some(finished_queue_item_id.as_str()) {
                     let mut orchestrator = orchestrator.lock().await;
-                    if orchestrator.state().playback().current_queue_item_id.as_deref()
+                    if orchestrator
+                        .state()
+                        .playback()
+                        .current_queue_item_id
+                        .as_deref()
                         == Some(finished_queue_item_id.as_str())
                         && let Err(error) = orchestrator.finish_current_track()
                     {
@@ -209,14 +227,17 @@ fn spawn_playback_monitor(
             } else if !snapshot.paused && Some(snapshot.position_ms) != last_position {
                 let mut orchestrator = orchestrator.lock().await;
                 if orchestrator.state().playback().state == PlaybackStatus::Playing
-                    && orchestrator.state().playback().current_queue_item_id.as_deref()
+                    && orchestrator
+                        .state()
+                        .playback()
+                        .current_queue_item_id
+                        .as_deref()
                         == current_queue_item_id.as_deref()
                 {
                     if let Err(error) = orchestrator.note_position(snapshot.position_ms) {
                         eprintln!(
                             "failed to publish playback position {}ms for {:?}: {error}",
-                            snapshot.position_ms,
-                            current_queue_item_id
+                            snapshot.position_ms, current_queue_item_id
                         );
                     } else {
                         last_position = Some(snapshot.position_ms);
@@ -314,9 +335,7 @@ fn user_message_for_playback_failure(code: &str) -> &'static str {
         "playback_url_invalid" | "playback_runtime_failed" => {
             "The backend could not prepare playback."
         }
-        "playback_worker_unavailable" => {
-            "The backend playback worker is unavailable."
-        }
+        "playback_worker_unavailable" => "The backend playback worker is unavailable.",
         _ => "Playback failed on the backend.",
     }
 }
@@ -347,13 +366,38 @@ fn app_router(state: AppState) -> Router {
         .route("/api/v1/commands/queue/remove", post(queue_remove_handler))
         .route("/api/v1/commands/queue/move", post(queue_move_handler))
         .route("/api/v1/commands/queue/clear", post(queue_clear_handler))
-        .route("/api/v1/commands/playback/play", post(playback_play_handler))
-        .route("/api/v1/commands/playback/pause", post(playback_pause_handler))
-        .route("/api/v1/commands/playback/play-pause", post(playback_play_pause_handler))
-        .route("/api/v1/commands/playback/stop", post(playback_stop_handler))
-        .route("/api/v1/commands/playback/next", post(playback_next_handler))
-        .route("/api/v1/commands/playback/previous", post(playback_previous_handler))
-        .route("/api/v1/commands/playback/seek", post(playback_seek_handler))
+        .route(
+            "/api/v1/commands/playback/play",
+            post(playback_play_handler),
+        )
+        .route(
+            "/api/v1/commands/playback/pause",
+            post(playback_pause_handler),
+        )
+        .route(
+            "/api/v1/commands/playback/play-pause",
+            post(playback_play_pause_handler),
+        )
+        .route(
+            "/api/v1/commands/playback/stop",
+            post(playback_stop_handler),
+        )
+        .route(
+            "/api/v1/commands/playback/next",
+            post(playback_next_handler),
+        )
+        .route(
+            "/api/v1/commands/playback/previous",
+            post(playback_previous_handler),
+        )
+        .route(
+            "/api/v1/commands/playback/seek",
+            post(playback_seek_handler),
+        )
+        .route(
+            "/api/v1/commands/playback/volume",
+            post(playback_volume_handler),
+        )
         .route(
             "/api/v1/search/results/{job_id}",
             get(search_results_handler),
@@ -604,8 +648,8 @@ async fn playback_previous_handler(
     State(state): State<AppState>,
     request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
-    let ExtractJson(_) = request
-        .map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/previous"))?;
+    let ExtractJson(_) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/previous"))?;
     let mut orchestrator = state.orchestrator.lock().await;
     let receipt = orchestrator.previous().map_err(|error| {
         report_playback_command_error(&mut orchestrator, &error);
@@ -626,6 +670,41 @@ async fn playback_seek_handler(
         report_playback_command_error(&mut orchestrator, &error);
         map_core_error(error, "/api/v1/commands/playback/seek")
     })?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_volume_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<PlaybackVolumeRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(request) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/volume"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .set_volume(request.volume_percent)
+        .map_err(|error| {
+            report_playback_command_error(&mut orchestrator, &error);
+            map_core_error(error, "/api/v1/commands/playback/volume")
+        })?;
+    let settings = *orchestrator.state().audio();
+    drop(orchestrator);
+
+    let save_result = {
+        let store = state.settings_store.lock().await;
+        store.save(&settings)
+    };
+
+    if let Err(error) = save_result {
+        let mut orchestrator = state.orchestrator.lock().await;
+        if let Err(report_error) = orchestrator.emit_system_error(
+            "audio_settings_persist_failed",
+            format!("Volume changed for this session, but saving it failed: {error}"),
+            CoreSystemErrorSeverity::Warning,
+        ) {
+            eprintln!("failed to emit audio settings persistence warning: {report_error}");
+        }
+    }
 
     Ok(command_accepted_response(receipt))
 }
@@ -697,6 +776,7 @@ fn map_state_snapshot(snapshot: CoreSnapshot) -> StateSnapshot {
             version: snapshot.backend.version,
         },
         playback: snapshot.playback,
+        audio: snapshot.audio,
         current_song: snapshot.current_song,
         queue: snapshot.queue,
         search_jobs: snapshot
@@ -731,6 +811,10 @@ fn map_server_event(core: CoreEvent) -> (EventName, Value) {
                 position_ms: event.position_ms,
             })
             .expect("playback state event should serialize"),
+        ),
+        CoreEvent::AudioSettingsChanged(event) => (
+            EventName::AudioSettingsChanged,
+            serde_json::to_value(event).expect("audio settings event should serialize"),
         ),
         CoreEvent::PlaybackTrackChanged(event) => (
             EventName::PlaybackTrackChanged,
@@ -972,29 +1056,50 @@ fn map_json_rejection(error: JsonRejection, instance: &str) -> (StatusCode, Json
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
-    use nocturne_api::{PlaybackSeekRequest, QueueAddRequest, QueueMoveRequest, QueueRemoveRequest, QueueResponse};
+    use nocturne_api::{
+        PlaybackSeekRequest, PlaybackVolumeRequest, QueueAddRequest, QueueMoveRequest,
+        QueueRemoveRequest, QueueResponse,
+    };
     use nocturne_core::{
         CoreEventKind, EventPublisherPort, SystemErrorEvent, SystemErrorSeverity as CoreSeverity,
     };
     use nocturne_domain::Song;
     use tower::ServiceExt;
 
+    static TEST_SETTINGS_STORE_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn test_settings_store() -> Arc<Mutex<LocalAudioSettingsStore>> {
+        let store_id = TEST_SETTINGS_STORE_ID.fetch_add(1, Ordering::Relaxed);
+        Arc::new(Mutex::new(LocalAudioSettingsStore::from_path(
+            std::env::temp_dir().join(format!(
+                "nocturne-test-audio-settings-{}-{store_id}.json",
+                std::process::id()
+            )),
+        )))
+    }
+
     fn test_state() -> AppState {
         let event_log = LocalEventLog::default();
         let event_publisher = BroadcastEventPublisher::new(event_log, 8);
-        let orchestrator = Orchestrator::new(
+        let mut orchestrator = Orchestrator::new(
             LocalClock::new(),
             LocalIdGenerator::new(),
             event_publisher.clone(),
             LocalPlaybackAdapter::new(SharedPlaybackState::default()),
             LocalSearchAdapter::new(LocalSearchRuntime::default()),
         );
+        orchestrator
+            .hydrate_audio_settings(AudioSettings::default())
+            .unwrap();
 
         AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             events: event_publisher,
+            settings_store: test_settings_store(),
         }
     }
 
@@ -1041,6 +1146,28 @@ mod tests {
         assert!(payload.backend.ready);
         assert!(payload.snapshot_id.starts_with("snap_"));
         assert_eq!(payload.queue.len(), 0);
+        assert_eq!(payload.audio.volume_percent, 50);
+    }
+
+    #[tokio::test]
+    async fn volume_command_updates_snapshot_audio_settings() {
+        let app = app_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/playback/volume")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&PlaybackVolumeRequest { volume_percent: 65 }).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
     }
 
     #[test]
@@ -1099,6 +1226,7 @@ mod tests {
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             events: event_publisher,
+            settings_store: test_settings_store(),
         });
 
         let response = app
@@ -1145,6 +1273,7 @@ mod tests {
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             events: event_publisher,
+            settings_store: test_settings_store(),
         });
 
         let response = app
@@ -1329,6 +1458,7 @@ mod tests {
         let state = AppState {
             orchestrator: orchestrator.clone(),
             events: event_publisher,
+            settings_store: test_settings_store(),
         };
 
         let job_id = {
@@ -1421,7 +1551,10 @@ mod tests {
             .expect("expected a system.error event");
 
         assert_eq!(system_error.code, "audio_output_unavailable");
-        assert_eq!(system_error.message, "Audio output is unavailable on the backend.");
+        assert_eq!(
+            system_error.message,
+            "Audio output is unavailable on the backend."
+        );
         assert_eq!(system_error.severity, CoreSeverity::Error);
     }
 
@@ -1451,13 +1584,18 @@ mod tests {
 
         let job_id = {
             let mut locked = orchestrator.lock().await;
-            locked.submit_search("queue add fixture").unwrap().job_id.unwrap()
+            locked
+                .submit_search("queue add fixture")
+                .unwrap()
+                .job_id
+                .unwrap()
         };
         process_pending_search_jobs(&orchestrator, &search_runtime).await;
 
         let app = app_router(AppState {
             orchestrator: orchestrator.clone(),
             events: event_publisher,
+            settings_store: test_settings_store(),
         });
 
         let response = app
@@ -1545,12 +1683,19 @@ mod tests {
             duration_ms: 123_000,
             source_url: String::from("https://www.youtube.com/watch?v=current-song"),
         };
-        let queue_item_id = orchestrator.enqueue_song(song).unwrap().queue_item_id.unwrap();
-        orchestrator.confirm_playback_started(&queue_item_id, 0).unwrap();
+        let queue_item_id = orchestrator
+            .enqueue_song(song)
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        orchestrator
+            .confirm_playback_started(&queue_item_id, 0)
+            .unwrap();
 
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             events: event_publisher,
+            settings_store: test_settings_store(),
         });
 
         let response = app
@@ -1570,7 +1715,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload.r#type, "https://nocturne.local/problems/current_queue_item_not_removable");
+        assert_eq!(
+            payload.r#type,
+            "https://nocturne.local/problems/current_queue_item_not_removable"
+        );
     }
 
     #[tokio::test]
@@ -1604,12 +1752,15 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
-        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
+        orchestrator
+            .confirm_playback_started("queue_item_0001", 0)
+            .unwrap();
         orchestrator.stop().unwrap();
 
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             events: event_publisher,
+            settings_store: test_settings_store(),
         });
 
         let response = app
@@ -1672,6 +1823,7 @@ mod tests {
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             events: event_publisher,
+            settings_store: test_settings_store(),
         });
 
         let response = app
@@ -1727,6 +1879,7 @@ mod tests {
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             events: event_publisher,
+            settings_store: test_settings_store(),
         });
 
         let response = app
@@ -1779,11 +1932,14 @@ mod tests {
                 source_url: String::from("https://example.com/a"),
             })
             .unwrap();
-        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
+        orchestrator
+            .confirm_playback_started("queue_item_0001", 0)
+            .unwrap();
 
         let app = app_router(AppState {
             orchestrator: Arc::new(Mutex::new(orchestrator)),
             events: event_publisher,
+            settings_store: test_settings_store(),
         });
 
         let response = app

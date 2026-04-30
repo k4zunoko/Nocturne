@@ -2,14 +2,15 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-use nocturne_domain::{PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, Song};
+use nocturne_domain::{
+    AudioSettings, PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, Song,
+};
 
 use crate::models::{
     BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreSnapshot,
     PlaybackPositionUpdatedEvent, PlaybackStateChangedEvent, PlaybackTrackChangedEvent,
     QueueUpdateReason, QueueUpdatedEvent, SearchJobCompletedEvent, SearchJobFailedEvent,
-    SearchJobRecord, SearchJobStatus, SearchResultsRecord, SystemErrorEvent,
-    SystemErrorSeverity,
+    SearchJobRecord, SearchJobStatus, SearchResultsRecord, SystemErrorEvent, SystemErrorSeverity,
 };
 use crate::ports::{
     ClockPort, EventPublisherPort, IdGeneratorPort, IdKind, PlaybackPort, PortError, SearchPort,
@@ -17,22 +18,10 @@ use crate::ports::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreError {
-    Validation {
-        code: &'static str,
-        message: String,
-    },
-    NotFound {
-        kind: &'static str,
-        id: String,
-    },
-    Conflict {
-        code: &'static str,
-        message: String,
-    },
-    Port {
-        code: String,
-        message: String,
-    },
+    Validation { code: &'static str, message: String },
+    NotFound { kind: &'static str, id: String },
+    Conflict { code: &'static str, message: String },
+    Port { code: String, message: String },
 }
 
 impl CoreError {
@@ -87,6 +76,7 @@ impl From<PortError> for CoreError {
 pub struct OrchestratorState {
     backend: BackendState,
     playback: PlaybackState,
+    audio: AudioSettings,
     queue: Vec<QueueItem>,
     search_jobs: Vec<SearchJobRecord>,
     search_results: BTreeMap<String, Vec<Song>>,
@@ -104,6 +94,7 @@ impl Default for OrchestratorState {
                 position_ms: 0,
                 current_queue_item_id: None,
             },
+            audio: AudioSettings::default(),
             queue: Vec::new(),
             search_jobs: Vec::new(),
             search_results: BTreeMap::new(),
@@ -162,6 +153,7 @@ where
         CoreSnapshot {
             backend: self.state.backend.clone(),
             playback: self.state.playback.clone(),
+            audio: self.state.audio,
             current_song: self.current_song().cloned(),
             queue: self.state.queue.clone(),
             search_jobs: self.state.search_jobs.clone(),
@@ -193,6 +185,28 @@ where
         Some(SearchResultsRecord { job, results })
     }
 
+    pub fn hydrate_audio_settings(&mut self, settings: AudioSettings) -> Result<(), CoreError> {
+        let settings = settings.clamped();
+        self.playback.set_volume(settings.gain())?;
+        self.state.audio = settings;
+        Ok(())
+    }
+
+    pub fn set_volume(&mut self, volume_percent: u8) -> Result<CommandReceipt, CoreError> {
+        if volume_percent > 100 {
+            return Err(CoreError::validation(
+                "volume_out_of_range",
+                "volume must be between 0 and 100",
+            ));
+        }
+
+        let settings = AudioSettings::new(volume_percent);
+        self.playback.set_volume(settings.gain())?;
+        self.state.audio = settings;
+        self.publish_audio_settings_changed()?;
+        self.command_accepted(None, None)
+    }
+
     pub fn submit_search(&mut self, query: impl AsRef<str>) -> Result<CommandReceipt, CoreError> {
         let query = query.as_ref().trim();
         if query.is_empty() {
@@ -214,16 +228,15 @@ where
             result_count: None,
         };
         self.state.search_jobs.push(summary.clone());
-        self.publish(CoreEventKind::SearchJobStarted, CoreEvent::SearchJobStarted(summary))?;
+        self.publish(
+            CoreEventKind::SearchJobStarted,
+            CoreEvent::SearchJobStarted(summary),
+        )?;
 
         self.command_accepted(Some(job_id), None)
     }
 
-    pub fn complete_search(
-        &mut self,
-        job_id: &str,
-        results: Vec<Song>,
-    ) -> Result<(), CoreError> {
+    pub fn complete_search(&mut self, job_id: &str, results: Vec<Song>) -> Result<(), CoreError> {
         let completed_at = self.clock.now();
         let result_count = u64::try_from(results.len()).map_err(|_| {
             CoreError::conflict("result_count_overflow", "search result count exceeds u64")
@@ -317,7 +330,8 @@ where
             .iter()
             .position(|item| item.id == queue_item_id)
             .ok_or_else(|| CoreError::not_found("queue_item", queue_item_id))?;
-        let removed_current = self.state.playback.current_queue_item_id.as_deref() == Some(queue_item_id);
+        let removed_current =
+            self.state.playback.current_queue_item_id.as_deref() == Some(queue_item_id);
 
         if removed_current {
             return Err(CoreError::conflict(
@@ -407,9 +421,7 @@ where
             ));
         }
 
-        if self.state.playback.state == PlaybackStatus::Paused
-            && self.current_index().is_some()
-        {
+        if self.state.playback.state == PlaybackStatus::Paused && self.current_index().is_some() {
             self.playback.resume()?;
             self.state.playback.state = PlaybackStatus::Playing;
             self.publish_playback_state_changed()?;
@@ -528,9 +540,7 @@ where
         self.state.playback.position_ms = position_ms;
         self.publish(
             CoreEventKind::PlaybackPositionUpdated,
-            CoreEvent::PlaybackPositionUpdated(PlaybackPositionUpdatedEvent {
-                position_ms,
-            }),
+            CoreEvent::PlaybackPositionUpdated(PlaybackPositionUpdatedEvent { position_ms }),
         )
     }
 
@@ -578,10 +588,7 @@ where
         Ok(true)
     }
 
-    pub fn report_playback_start_failed(
-        &mut self,
-        queue_item_id: &str,
-    ) -> Result<bool, CoreError> {
+    pub fn report_playback_start_failed(&mut self, queue_item_id: &str) -> Result<bool, CoreError> {
         if self.state.playback.state != PlaybackStatus::Loading
             || self.state.playback.current_queue_item_id.as_deref() != Some(queue_item_id)
         {
@@ -592,7 +599,12 @@ where
         self.state.playback.position_ms = 0;
         self.state.playback.current_queue_item_id = None;
 
-        if let Some(queue_item) = self.state.queue.iter_mut().find(|item| item.id == queue_item_id) {
+        if let Some(queue_item) = self
+            .state
+            .queue
+            .iter_mut()
+            .find(|item| item.id == queue_item_id)
+        {
             queue_item.status = QueueItemStatus::Failed;
         }
 
@@ -618,13 +630,12 @@ where
     }
 
     fn start_track(&mut self, index: usize, position_ms: u64) -> Result<(), CoreError> {
-        let item = self
-            .state
-            .queue
-            .get(index)
-            .cloned()
-            .ok_or_else(|| CoreError::conflict("queue_empty", "no queue item available to play"))?;
-        let track_changed = self.state.playback.current_queue_item_id.as_deref() != Some(item.id.as_str());
+        let item =
+            self.state.queue.get(index).cloned().ok_or_else(|| {
+                CoreError::conflict("queue_empty", "no queue item available to play")
+            })?;
+        let track_changed =
+            self.state.playback.current_queue_item_id.as_deref() != Some(item.id.as_str());
 
         self.state.playback.state = PlaybackStatus::Loading;
         self.state.playback.position_ms = position_ms;
@@ -672,6 +683,13 @@ where
         )
     }
 
+    fn publish_audio_settings_changed(&mut self) -> Result<(), CoreError> {
+        self.publish(
+            CoreEventKind::AudioSettingsChanged,
+            CoreEvent::AudioSettingsChanged(self.state.audio),
+        )
+    }
+
     fn publish_queue_updated(&mut self, reason: QueueUpdateReason) -> Result<(), CoreError> {
         self.publish(
             CoreEventKind::QueueUpdated,
@@ -683,7 +701,12 @@ where
     }
 
     fn publish(&mut self, kind: CoreEventKind, event: CoreEvent) -> Result<(), CoreError> {
-        let envelope = CoreEventEnvelope::new(self.ids.next_id(IdKind::Event), kind, self.clock.now(), event);
+        let envelope = CoreEventEnvelope::new(
+            self.ids.next_id(IdKind::Event),
+            kind,
+            self.clock.now(),
+            event,
+        );
         self.events.publish(envelope)?;
         Ok(())
     }
@@ -712,7 +735,10 @@ where
 
     fn current_index(&self) -> Option<usize> {
         let current_id = self.state.playback.current_queue_item_id.as_deref()?;
-        self.state.queue.iter().position(|item| item.id == current_id)
+        self.state
+            .queue
+            .iter()
+            .position(|item| item.id == current_id)
     }
 
     fn find_search_job_mut(&mut self, job_id: &str) -> Result<&mut SearchJobRecord, CoreError> {
@@ -733,7 +759,10 @@ where
 
     fn normalize_queue_for_stop(&mut self) {
         for item in &mut self.state.queue {
-            if matches!(item.status, QueueItemStatus::Playing | QueueItemStatus::Loading) {
+            if matches!(
+                item.status,
+                QueueItemStatus::Playing | QueueItemStatus::Loading
+            ) {
                 item.status = QueueItemStatus::Queued;
             }
         }
@@ -745,7 +774,11 @@ where
             && !self.state.queue.is_empty()
     }
 
-    fn apply_queue_statuses(&mut self, current_index: Option<usize>, current_status: QueueItemStatus) {
+    fn apply_queue_statuses(
+        &mut self,
+        current_index: Option<usize>,
+        current_status: QueueItemStatus,
+    ) {
         match current_index {
             Some(current_index) => {
                 for (index, item) in self.state.queue.iter_mut().enumerate() {
@@ -773,6 +806,11 @@ impl OrchestratorState {
     }
 
     #[must_use]
+    pub fn audio(&self) -> &AudioSettings {
+        &self.audio
+    }
+
+    #[must_use]
     pub fn queue(&self) -> &[QueueItem] {
         &self.queue
     }
@@ -787,7 +825,9 @@ impl OrchestratorState {
 mod tests {
     use super::*;
 
-    use crate::ports::{ClockPort, EventPublisherPort, IdGeneratorPort, IdKind, PlaybackPort, SearchPort};
+    use crate::ports::{
+        ClockPort, EventPublisherPort, IdGeneratorPort, IdKind, PlaybackPort, SearchPort,
+    };
 
     #[derive(Default)]
     struct StubClock;
@@ -823,10 +863,7 @@ mod tests {
     }
 
     impl EventPublisherPort for StubEvents {
-        fn publish(
-            &mut self,
-            event: CoreEventEnvelope<CoreEvent>,
-        ) -> Result<(), PortError> {
+        fn publish(&mut self, event: CoreEventEnvelope<CoreEvent>) -> Result<(), PortError> {
             self.published.push(event);
             Ok(())
         }
@@ -835,6 +872,7 @@ mod tests {
     #[derive(Default)]
     struct StubPlayback {
         started: Vec<String>,
+        volumes: Vec<f32>,
         paused: usize,
         resumed: usize,
         stopped: usize,
@@ -844,6 +882,11 @@ mod tests {
     impl PlaybackPort for StubPlayback {
         fn start(&mut self, item: &QueueItem, position_ms: u64) -> Result<(), PortError> {
             self.started.push(format!("{}@{}", item.id, position_ms));
+            Ok(())
+        }
+
+        fn set_volume(&mut self, gain: f32) -> Result<(), PortError> {
+            self.volumes.push(gain);
             Ok(())
         }
 
@@ -903,9 +946,16 @@ mod tests {
         orchestrator.enqueue_song(song("song_1")).unwrap();
 
         assert_eq!(orchestrator.queue().len(), 1);
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Loading);
         assert_eq!(
-            orchestrator.state().playback().current_queue_item_id.as_deref(),
+            orchestrator.state().playback().state,
+            PlaybackStatus::Loading
+        );
+        assert_eq!(
+            orchestrator
+                .state()
+                .playback()
+                .current_queue_item_id
+                .as_deref(),
             Some("queue_item_0001")
         );
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Loading);
@@ -915,7 +965,10 @@ mod tests {
             .confirm_playback_started("queue_item_0001", 0)
             .unwrap();
 
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Playing);
+        assert_eq!(
+            orchestrator.state().playback().state,
+            PlaybackStatus::Playing
+        );
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
     }
 
@@ -943,9 +996,16 @@ mod tests {
 
         orchestrator.enqueue_song(song("song_2")).unwrap();
 
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Paused);
         assert_eq!(
-            orchestrator.state().playback().current_queue_item_id.as_deref(),
+            orchestrator.state().playback().state,
+            PlaybackStatus::Paused
+        );
+        assert_eq!(
+            orchestrator
+                .state()
+                .playback()
+                .current_queue_item_id
+                .as_deref(),
             Some(first_queue_item_id.as_str())
         );
         assert_eq!(orchestrator.queue().len(), 2);
@@ -988,8 +1048,14 @@ mod tests {
 
         let accepted = orchestrator.submit_search("utada traveling").unwrap();
         let job_id = accepted.job_id.clone().unwrap();
-        orchestrator.complete_search(&job_id, vec![song("song_1")]).unwrap();
-        let queue_item_id = orchestrator.enqueue_song_by_id("song_1").unwrap().queue_item_id.unwrap();
+        orchestrator
+            .complete_search(&job_id, vec![song("song_1")])
+            .unwrap();
+        let queue_item_id = orchestrator
+            .enqueue_song_by_id("song_1")
+            .unwrap()
+            .queue_item_id
+            .unwrap();
         orchestrator
             .confirm_playback_started(&queue_item_id, 0)
             .unwrap();
@@ -1029,7 +1095,11 @@ mod tests {
         assert_eq!(orchestrator.queue()[0].song.id, "song_2");
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
         assert_eq!(
-            orchestrator.state().playback().current_queue_item_id.as_deref(),
+            orchestrator
+                .state()
+                .playback()
+                .current_queue_item_id
+                .as_deref(),
             Some(second_queue_item_id.as_str())
         );
     }
@@ -1050,7 +1120,9 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
-        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
+        orchestrator
+            .confirm_playback_started("queue_item_0001", 0)
+            .unwrap();
 
         orchestrator.next().unwrap();
         orchestrator
@@ -1073,7 +1145,9 @@ mod tests {
         );
 
         orchestrator.enqueue_song(song("song_1")).unwrap();
-        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
+        orchestrator
+            .confirm_playback_started("queue_item_0001", 0)
+            .unwrap();
         orchestrator.seek(12_345).unwrap();
 
         orchestrator.previous().unwrap();
@@ -1097,8 +1171,16 @@ mod tests {
             StubSearch::default(),
         );
 
-        let first_id = orchestrator.enqueue_song(song("song_1")).unwrap().queue_item_id.unwrap();
-        let second_id = orchestrator.enqueue_song(song("song_2")).unwrap().queue_item_id.unwrap();
+        let first_id = orchestrator
+            .enqueue_song(song("song_1"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        let second_id = orchestrator
+            .enqueue_song(song("song_2"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
         orchestrator.confirm_playback_started(&first_id, 0).unwrap();
 
         let error = orchestrator.move_queue_item(&second_id, 0).unwrap_err();
@@ -1106,12 +1188,22 @@ mod tests {
         match error {
             CoreError::Conflict { code, message } => {
                 assert_eq!(code, "queue_move_before_current_not_allowed");
-                assert_eq!(message, "cannot move a queued item before the currently playing item");
+                assert_eq!(
+                    message,
+                    "cannot move a queued item before the currently playing item"
+                );
             }
             other => panic!("unexpected error: {other}"),
         }
 
-        assert_eq!(orchestrator.state().playback().current_queue_item_id.as_deref(), Some(first_id.as_str()));
+        assert_eq!(
+            orchestrator
+                .state()
+                .playback()
+                .current_queue_item_id
+                .as_deref(),
+            Some(first_id.as_str())
+        );
     }
 
     #[test]
@@ -1125,9 +1217,13 @@ mod tests {
         );
 
         orchestrator.enqueue_song(song("song_1")).unwrap();
-        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
+        orchestrator
+            .confirm_playback_started("queue_item_0001", 0)
+            .unwrap();
 
-        let error = orchestrator.remove_queue_item("queue_item_0001").unwrap_err();
+        let error = orchestrator
+            .remove_queue_item("queue_item_0001")
+            .unwrap_err();
 
         match error {
             CoreError::Conflict { code, message } => {
@@ -1142,7 +1238,14 @@ mod tests {
 
     impl PlaybackPort for FailingPlayback {
         fn start(&mut self, _item: &QueueItem, _position_ms: u64) -> Result<(), PortError> {
-            Err(PortError::new("playback_start_failed", "stub start failure"))
+            Err(PortError::new(
+                "playback_start_failed",
+                "stub start failure",
+            ))
+        }
+
+        fn set_volume(&mut self, _gain: f32) -> Result<(), PortError> {
+            Ok(())
         }
 
         fn pause(&mut self) -> Result<(), PortError> {
@@ -1184,7 +1287,10 @@ mod tests {
 
         assert_eq!(orchestrator.queue().len(), 1);
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Failed);
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Stopped);
+        assert_eq!(
+            orchestrator.state().playback().state,
+            PlaybackStatus::Stopped
+        );
         assert_eq!(orchestrator.state().playback().current_queue_item_id, None);
     }
 
@@ -1198,18 +1304,47 @@ mod tests {
             StubSearch::default(),
         );
 
-        let queue_item_id = orchestrator.enqueue_song(song("song_1")).unwrap().queue_item_id.unwrap();
+        let queue_item_id = orchestrator
+            .enqueue_song(song("song_1"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
 
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Loading);
+        assert_eq!(
+            orchestrator.state().playback().state,
+            PlaybackStatus::Loading
+        );
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Loading);
 
         orchestrator
             .confirm_playback_started(&queue_item_id, 321)
             .unwrap();
 
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Playing);
+        assert_eq!(
+            orchestrator.state().playback().state,
+            PlaybackStatus::Playing
+        );
         assert_eq!(orchestrator.state().playback().position_ms, 321);
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+    }
+
+    #[test]
+    fn volume_is_updated_and_kept_in_snapshot() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.set_volume(65).unwrap();
+
+        assert_eq!(orchestrator.state().audio().volume_percent, 65);
+        assert_eq!(orchestrator.playback.volumes, vec![0.65]);
+
+        let snapshot = orchestrator.snapshot();
+        assert_eq!(snapshot.audio.volume_percent, 65);
     }
 
     #[test]
@@ -1222,13 +1357,20 @@ mod tests {
             StubSearch::default(),
         );
 
-        let queue_item_id = orchestrator.enqueue_song(song("song_1")).unwrap().queue_item_id.unwrap();
+        let queue_item_id = orchestrator
+            .enqueue_song(song("song_1"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
 
         orchestrator
             .report_playback_start_failed(&queue_item_id)
             .unwrap();
 
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Stopped);
+        assert_eq!(
+            orchestrator.state().playback().state,
+            PlaybackStatus::Stopped
+        );
         assert_eq!(orchestrator.state().playback().current_queue_item_id, None);
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Failed);
     }

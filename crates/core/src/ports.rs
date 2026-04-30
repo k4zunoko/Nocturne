@@ -63,6 +63,8 @@ pub trait EventPublisherPort {
 pub trait PlaybackPort {
     fn start(&mut self, item: &QueueItem, position_ms: u64) -> Result<(), PortError>;
 
+    fn set_volume(&mut self, gain: f32) -> Result<(), PortError>;
+
     fn pause(&mut self) -> Result<(), PortError>;
 
     fn resume(&mut self) -> Result<(), PortError>;

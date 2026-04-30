@@ -7,8 +7,7 @@ use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
 use tokio::runtime::Builder as RuntimeBuilder;
 
-const YT_DLP_AUDIO_FORMAT: &str =
-    "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
+const YT_DLP_AUDIO_FORMAT: &str = "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source_url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
@@ -100,7 +99,9 @@ fn yt_dlp_executable() -> std::ffi::OsString {
     std::env::var_os("NOCTURNE_YT_DLP_PATH")
         .or_else(|| {
             let windows_fallback = std::path::PathBuf::from(r"C:\tools\yt-dlp\yt-dlp.exe");
-            windows_fallback.is_file().then(|| windows_fallback.into_os_string())
+            windows_fallback
+                .is_file()
+                .then(|| windows_fallback.into_os_string())
         })
         .unwrap_or_else(|| "yt-dlp".into())
 }

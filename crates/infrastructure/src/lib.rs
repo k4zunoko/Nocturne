@@ -3,6 +3,7 @@ mod clock;
 mod events;
 mod ids;
 mod search;
+mod settings;
 
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Mutex, MutexGuard};
@@ -14,9 +15,8 @@ pub use audio::{
 pub use clock::LocalClock;
 pub use events::{BroadcastEventPublisher, EventCursorError, LocalEventLog, LocalEventPublisher};
 pub use ids::LocalIdGenerator;
-pub use search::{
-    LocalSearchAdapter, LocalSearchFailure, LocalSearchRuntime, PendingSearchJob,
-};
+pub use search::{LocalSearchAdapter, LocalSearchFailure, LocalSearchRuntime, PendingSearchJob};
+pub use settings::LocalAudioSettingsStore;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfrastructureProfile {

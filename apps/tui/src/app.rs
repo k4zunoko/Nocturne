@@ -2,8 +2,10 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nocturne_api::{BackendStatus, SearchJobSummary, SearchJobStatus, StateSnapshot};
-use nocturne_domain::{PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, Song};
+use nocturne_api::{BackendStatus, SearchJobStatus, SearchJobSummary, StateSnapshot};
+use nocturne_domain::{
+    AudioSettings, PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, Song,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -84,6 +86,7 @@ pub struct App {
     backend_addr: SocketAddr,
     backend: BackendStatus,
     playback: PlaybackState,
+    audio: AudioSettings,
     current_song: Option<Song>,
     queue: Vec<QueueItem>,
     search_jobs: Vec<SearchJobSummary>,
@@ -116,6 +119,7 @@ impl App {
                 position_ms: 0,
                 current_queue_item_id: None,
             },
+            audio: AudioSettings::default(),
             current_song: None,
             queue: Vec::new(),
             search_jobs: Vec::new(),
@@ -139,6 +143,7 @@ impl App {
     pub fn apply_snapshot(&mut self, snapshot: StateSnapshot, current_event_id: Option<String>) {
         self.backend = snapshot.backend;
         self.playback = snapshot.playback;
+        self.audio = snapshot.audio;
         self.current_song = snapshot.current_song;
         self.queue = snapshot.queue;
         self.search_jobs = snapshot.search_jobs;
@@ -158,6 +163,9 @@ impl App {
         self.last_event_id = Some(event.event_id);
 
         match event.kind {
+            BackendEventKind::AudioSettingsChanged(payload) => {
+                self.audio = payload;
+            }
             BackendEventKind::PlaybackStateChanged(payload) => {
                 self.playback.state = payload.state;
                 self.playback.current_queue_item_id = payload.current_queue_item_id;
@@ -176,7 +184,7 @@ impl App {
             }
             BackendEventKind::PlaybackPositionUpdated(payload) => {
                 self.playback.position_ms = payload.position_ms;
-                 self.playback_progress_confirmed = true;
+                self.playback_progress_confirmed = true;
                 self.sync_playback_anchor(payload.position_ms);
             }
             BackendEventKind::QueueUpdated(payload) => {
@@ -214,7 +222,9 @@ impl App {
 
     pub fn apply_command_result(&mut self, result: Result<CommandOutcome, String>) {
         match result {
-            Ok(CommandOutcome::StatusMessage(message)) => self.set_status(StatusLevel::Info, message),
+            Ok(CommandOutcome::StatusMessage(message)) => {
+                self.set_status(StatusLevel::Info, message)
+            }
             Ok(CommandOutcome::SearchSubmitted { job_id, query }) => {
                 self.open_search_overlay(job_id, query);
                 self.apply_pending_terminal_state();
@@ -263,6 +273,8 @@ impl App {
                     return AppAction::None;
                 }
                 KeyCode::Char('p') => return AppAction::Command(CommandAction::PlayPause),
+                KeyCode::Up => return self.adjust_volume(5),
+                KeyCode::Down => return self.adjust_volume(-5),
                 KeyCode::Left => return AppAction::Command(CommandAction::Previous),
                 KeyCode::Right => return AppAction::Command(CommandAction::Next),
                 _ => {}
@@ -344,7 +356,9 @@ impl App {
                 self.input.move_end();
                 AppAction::None
             }
-            KeyCode::Char(ch) if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT => {
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
                 self.input.insert(ch);
                 AppAction::None
             }
@@ -478,7 +492,9 @@ impl App {
     }
 
     fn search_overlay_state(&self) -> Option<SearchOverlayState> {
-        self.search_overlay.as_ref().map(|search| search.state.clone())
+        self.search_overlay
+            .as_ref()
+            .map(|search| search.state.clone())
     }
 
     fn toggle_help_overlay(&mut self) {
@@ -550,7 +566,10 @@ impl App {
     fn submit_input(&mut self) -> AppAction {
         let text = self.input.text.trim().to_owned();
         if text.is_empty() {
-            self.set_status(StatusLevel::Warning, String::from("Enter a search query first."));
+            self.set_status(
+                StatusLevel::Warning,
+                String::from("Enter a search query first."),
+            );
             return AppAction::None;
         }
 
@@ -626,7 +645,8 @@ impl App {
             let _ = search;
             self.set_status(StatusLevel::Info, status_message);
         } else {
-            self.pending_search_terminal = Some((job_id, PendingSearchTerminalState::Completed(results)));
+            self.pending_search_terminal =
+                Some((job_id, PendingSearchTerminalState::Completed(results)));
         }
     }
 
@@ -645,10 +665,8 @@ impl App {
             self.pending_search_results_request = None;
             self.set_status(StatusLevel::Error, message);
         } else {
-            self.pending_search_terminal = Some((
-                job_id,
-                PendingSearchTerminalState::Failed(message),
-            ));
+            self.pending_search_terminal =
+                Some((job_id, PendingSearchTerminalState::Failed(message)));
         }
     }
 
@@ -701,9 +719,15 @@ impl App {
 
         match job.status {
             SearchJobStatus::Completed => {
-                if matches!(self.search_overlay_state(), Some(SearchOverlayState::Loading)) {
+                if matches!(
+                    self.search_overlay_state(),
+                    Some(SearchOverlayState::Loading)
+                ) {
                     self.pending_search_results_request = Some(job.job_id);
-                    self.set_status(StatusLevel::Info, String::from("Refreshing search results..."));
+                    self.set_status(
+                        StatusLevel::Info,
+                        String::from("Refreshing search results..."),
+                    );
                 }
             }
             SearchJobStatus::Failed => {
@@ -735,15 +759,18 @@ impl App {
 
         let elapsed_ms = self.playback_anchor_at.elapsed().as_millis() as u64;
         let position_ms = self.playback_anchor_ms.saturating_add(elapsed_ms);
-        let duration_ms = self.current_song.as_ref().map_or(u64::MAX, |song| song.duration_ms);
+        let duration_ms = self
+            .current_song
+            .as_ref()
+            .map_or(u64::MAX, |song| song.duration_ms);
         position_ms.min(duration_ms)
     }
 
     fn now_playing_widget(&self) -> Paragraph<'static> {
-        let title = self
-            .current_song
-            .as_ref()
-            .map_or_else(|| String::from("Nothing queued yet"), |song| song.title.clone());
+        let title = self.current_song.as_ref().map_or_else(
+            || String::from("Nothing queued yet"),
+            |song| song.title.clone(),
+        );
         let channel = self.current_song.as_ref().map_or_else(
             || String::from("Add a song from search once that flow is wired."),
             |song| song.channel_name.clone(),
@@ -754,11 +781,17 @@ impl App {
             PlaybackStatus::Playing => "Playing",
             PlaybackStatus::Paused => "Paused",
         };
-        let duration_ms = self.current_song.as_ref().map_or(1, |song| song.duration_ms.max(1));
+        let duration_ms = self
+            .current_song
+            .as_ref()
+            .map_or(1, |song| song.duration_ms.max(1));
 
         let lines = vec![
             Line::from(vec![
-                Span::styled("Now Playing ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "Now Playing ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(title),
             ]),
             Line::from(channel),
@@ -767,6 +800,11 @@ impl App {
                 state_label,
                 format_duration(self.display_position_ms),
                 format_duration(duration_ms)
+            )),
+            Line::from(format!(
+                "Volume {}% {}",
+                self.audio.volume_percent,
+                progress_bar(u64::from(self.audio.volume_percent), 100, 16)
             )),
             Line::from(progress_bar(self.display_position_ms, duration_ms, 32)),
             Line::from(String::new()),
@@ -818,7 +856,11 @@ impl App {
         }
 
         Paragraph::new(lines)
-            .block(Block::default().title("Queue Snapshot").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title("Queue Snapshot")
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: false })
     }
 
@@ -833,7 +875,11 @@ impl App {
             .version
             .clone()
             .unwrap_or_else(|| String::from("unknown"));
-        let readiness = if self.backend.ready { "ready" } else { "starting" };
+        let readiness = if self.backend.ready {
+            "ready"
+        } else {
+            "starting"
+        };
         let message = Line::from(vec![
             Span::styled("Backend ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!("{} ({})", readiness, version)),
@@ -848,7 +894,7 @@ impl App {
 
     fn shortcuts_widget(&self) -> Paragraph<'static> {
         Paragraph::new(Line::from(
-            "Enter search  Ctrl+P play/pause  Ctrl+Left previous  Ctrl+Right next  Ctrl+Q queue  F1 help  /exit quit",
+            "Enter search  Ctrl+P play/pause  Ctrl+Up/Down volume  Ctrl+Left previous  Ctrl+Right next  Ctrl+Q queue  F1 help  /exit quit",
         ))
         .style(Style::default().fg(Color::DarkGray))
     }
@@ -868,7 +914,9 @@ impl App {
             self.queue
                 .iter()
                 .enumerate()
-                .map(|(index, item)| ListItem::new(self.format_queue_row(item, index == self.queue_selection)))
+                .map(|(index, item)| {
+                    ListItem::new(self.format_queue_row(item, index == self.queue_selection))
+                })
                 .collect()
         };
 
@@ -910,7 +958,11 @@ impl App {
 
         let layout = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(6), Constraint::Length(2)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(6),
+                Constraint::Length(2),
+            ])
             .split(overlay_area);
 
         let header = Paragraph::new(vec![
@@ -925,16 +977,22 @@ impl App {
                 SearchOverlayState::Error => "Search failed before results became available.",
             }),
         ])
-        .block(Block::default().title("Search Results").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Search Results")
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: true });
         frame.render_widget(header, layout[0]);
 
         match search.state {
             SearchOverlayState::Loading => {
                 frame.render_widget(
-                    Paragraph::new("Searching… you can close this overlay, and late results will stay hidden.")
-                        .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
-                        .wrap(Wrap { trim: true }),
+                    Paragraph::new(
+                        "Searching… you can close this overlay, and late results will stay hidden.",
+                    )
+                    .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
+                    .wrap(Wrap { trim: true }),
                     layout[1],
                 );
             }
@@ -945,19 +1003,22 @@ impl App {
                     .enumerate()
                     .map(|(index, song)| {
                         let is_selected = index == search.selected;
-                        let mut lines = vec![Line::from(vec![
-                            Span::styled(
-                                song.title.clone(),
-                                if is_selected {
-                                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
-                                } else {
-                                    Style::default().fg(Color::White)
-                                },
-                            ),
-                        ])];
+                        let mut lines = vec![Line::from(vec![Span::styled(
+                            song.title.clone(),
+                            if is_selected {
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(Color::White)
+                            },
+                        )])];
                         if is_selected {
                             lines.push(Line::from(vec![
-                                Span::styled(song.channel_name.clone(), Style::default().fg(Color::Gray)),
+                                Span::styled(
+                                    song.channel_name.clone(),
+                                    Style::default().fg(Color::Gray),
+                                ),
                                 Span::raw(" • "),
                                 Span::styled(
                                     format_duration(song.duration_ms),
@@ -992,10 +1053,15 @@ impl App {
             }
             SearchOverlayState::Error => {
                 frame.render_widget(
-                    Paragraph::new(search.error_message.clone().unwrap_or_else(|| String::from("Search failed.")))
-                        .style(Style::default().fg(Color::LightRed))
-                        .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
-                        .wrap(Wrap { trim: true }),
+                    Paragraph::new(
+                        search
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| String::from("Search failed.")),
+                    )
+                    .style(Style::default().fg(Color::LightRed))
+                    .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
+                    .wrap(Wrap { trim: true }),
                     layout[1],
                 );
             }
@@ -1028,6 +1094,7 @@ impl App {
                 Line::from(""),
                 Line::from("Playback"),
                 Line::from("  Ctrl+P play / pause"),
+                Line::from("  Ctrl+Up / Ctrl+Down volume +/- 5%"),
                 Line::from("  Ctrl+Left / Ctrl+Right previous / next"),
                 Line::from(""),
                 Line::from("Overlays"),
@@ -1067,7 +1134,11 @@ impl App {
             Span::styled(item.song.title.clone(), style),
             Span::raw("  "),
             Span::styled(
-                format!("{} • {}", item.song.channel_name, format_duration(item.song.duration_ms)),
+                format!(
+                    "{} • {}",
+                    item.song.channel_name,
+                    format_duration(item.song.duration_ms)
+                ),
                 Style::default().fg(Color::Gray),
             ),
         ])
@@ -1076,6 +1147,16 @@ impl App {
     fn set_status(&mut self, level: StatusLevel, message: String) {
         self.status_level = level;
         self.status_message = message;
+    }
+
+    fn adjust_volume(&mut self, delta: i16) -> AppAction {
+        let next = (i16::from(self.audio.volume_percent) + delta).clamp(0, 100) as u8;
+        if next == self.audio.volume_percent {
+            return AppAction::None;
+        }
+
+        self.audio = AudioSettings::new(next);
+        AppAction::Command(CommandAction::SetVolume(next))
     }
 }
 
@@ -1353,7 +1434,10 @@ mod tests {
 
         let search = app.search_overlay.as_ref().unwrap();
         assert_eq!(search.results.len(), MAX_SEARCH_RESULTS);
-        assert_eq!(search.results.last().map(|song| song.id.as_str()), Some("song_5"));
+        assert_eq!(
+            search.results.last().map(|song| song.id.as_str()),
+            Some("song_5")
+        );
     }
 
     #[test]
@@ -1452,6 +1536,7 @@ mod tests {
                     position_ms: 0,
                     current_queue_item_id: None,
                 },
+                audio: AudioSettings::default(),
                 current_song: None,
                 queue: Vec::new(),
                 search_jobs: vec![SearchJobSummary {
@@ -1492,6 +1577,7 @@ mod tests {
                     position_ms: 0,
                     current_queue_item_id: None,
                 },
+                audio: AudioSettings::default(),
                 current_song: None,
                 queue: Vec::new(),
                 search_jobs: vec![SearchJobSummary {
