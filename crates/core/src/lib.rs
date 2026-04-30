@@ -11,10 +11,9 @@ use nocturne_domain::{PlaybackState, PlaybackStatus};
 
 pub use models::{
     BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreId,
-    CoreSnapshot, CoreTimestamp, PlaybackPositionUpdatedEvent, PlaybackStateChangedEvent,
-    PlaybackTrackChangedEvent, QueueUpdateReason, QueueUpdatedEvent, SearchJobCompletedEvent,
-    SearchJobFailedEvent, SearchJobRecord, SearchJobStatus, SearchResultsRecord, SystemErrorEvent,
-    SystemErrorSeverity,
+    CoreSnapshot, CoreTimestamp, PlaybackProgressEvent, SearchJobCompletedEvent,
+    SearchJobFailedEvent, SearchJobRecord, SearchJobStatus, SearchResultsRecord,
+    StateUpdatedEvent, SystemErrorEvent, SystemErrorSeverity,
 };
 pub use orchestrator::{CoreError, Orchestrator};
 pub use ports::{
@@ -41,6 +40,7 @@ impl NocturneCore {
             state: PlaybackStatus::Stopped,
             position_ms: 0,
             current_queue_item_id: None,
+            playback_session_id: None,
         }
     }
 }

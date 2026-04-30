@@ -78,6 +78,7 @@ pub struct StateSnapshot {
     pub current_song: Option<Song>,
     pub queue: Vec<QueueItem>,
     pub search_jobs: Vec<SearchJobSummary>,
+    pub revision: u64,
     pub snapshot_id: Id,
     pub timestamp: Timestamp,
 }
@@ -178,27 +179,9 @@ pub enum SystemErrorSeverity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaybackStateChanged {
-    pub state: nocturne_domain::PlaybackStatus,
-    pub current_queue_item_id: Option<Id>,
+pub struct PlaybackProgress {
+    pub playback_session_id: Id,
     pub position_ms: DurationMs,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaybackTrackChanged {
-    pub queue_item_id: Id,
-    pub song: Song,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaybackPositionUpdated {
-    pub position_ms: DurationMs,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueueUpdated {
-    pub reason: QueueUpdateReason,
-    pub items: Vec<QueueItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,11 +208,8 @@ pub struct SystemError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventName {
-    PlaybackStateChanged,
-    AudioSettingsChanged,
-    PlaybackTrackChanged,
-    PlaybackPositionUpdated,
-    QueueUpdated,
+    StateUpdated,
+    PlaybackProgress,
     SearchJobStarted,
     SearchJobCompleted,
     SearchJobFailed,
@@ -239,11 +219,8 @@ pub enum EventName {
 impl Display for EventName {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = match self {
-            Self::PlaybackStateChanged => "playback.state.changed",
-            Self::AudioSettingsChanged => "audio.settings.changed",
-            Self::PlaybackTrackChanged => "playback.track.changed",
-            Self::PlaybackPositionUpdated => "playback.position.updated",
-            Self::QueueUpdated => "queue.updated",
+            Self::StateUpdated => "state.updated",
+            Self::PlaybackProgress => "playback.progress",
             Self::SearchJobStarted => "search.job.started",
             Self::SearchJobCompleted => "search.job.completed",
             Self::SearchJobFailed => "search.job.failed",
@@ -277,16 +254,10 @@ impl<T> EventEnvelope<T> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data")]
 pub enum ServerEvent {
-    #[serde(rename = "playback.state.changed")]
-    PlaybackStateChanged(PlaybackStateChanged),
-    #[serde(rename = "audio.settings.changed")]
-    AudioSettingsChanged(AudioSettings),
-    #[serde(rename = "playback.track.changed")]
-    PlaybackTrackChanged(PlaybackTrackChanged),
-    #[serde(rename = "playback.position.updated")]
-    PlaybackPositionUpdated(PlaybackPositionUpdated),
-    #[serde(rename = "queue.updated")]
-    QueueUpdated(QueueUpdated),
+    #[serde(rename = "state.updated")]
+    StateUpdated(StateSnapshot),
+    #[serde(rename = "playback.progress")]
+    PlaybackProgress(PlaybackProgress),
     #[serde(rename = "search.job.started")]
     SearchJobStarted(SearchJobSummary),
     #[serde(rename = "search.job.completed")]

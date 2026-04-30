@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use nocturne_domain::{AudioSettings, PlaybackState, PlaybackStatus, QueueItem, Song};
+use nocturne_domain::{AudioSettings, PlaybackState, QueueItem, Song};
 
 pub type CoreId = String;
 pub type CoreTimestamp = String;
@@ -43,6 +43,7 @@ pub struct CoreSnapshot {
     pub current_song: Option<Song>,
     pub queue: Vec<QueueItem>,
     pub search_jobs: Vec<SearchJobRecord>,
+    pub revision: u64,
     pub snapshot_id: CoreId,
     pub timestamp: CoreTimestamp,
 }
@@ -56,42 +57,20 @@ pub struct CommandReceipt {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueueUpdateReason {
-    Add,
-    Remove,
-    Move,
-    Clear,
-    CurrentChanged,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SystemErrorSeverity {
     Warning,
     Error,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaybackStateChangedEvent {
-    pub state: PlaybackStatus,
-    pub current_queue_item_id: Option<CoreId>,
+pub struct StateUpdatedEvent {
+    pub snapshot: CoreSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaybackProgressEvent {
+    pub playback_session_id: CoreId,
     pub position_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaybackTrackChangedEvent {
-    pub queue_item_id: CoreId,
-    pub song: Song,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaybackPositionUpdatedEvent {
-    pub position_ms: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueueUpdatedEvent {
-    pub reason: QueueUpdateReason,
-    pub items: Vec<QueueItem>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,11 +95,8 @@ pub struct SystemErrorEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreEvent {
-    PlaybackStateChanged(PlaybackStateChangedEvent),
-    AudioSettingsChanged(AudioSettings),
-    PlaybackTrackChanged(PlaybackTrackChangedEvent),
-    PlaybackPositionUpdated(PlaybackPositionUpdatedEvent),
-    QueueUpdated(QueueUpdatedEvent),
+    StateUpdated(StateUpdatedEvent),
+    PlaybackProgress(PlaybackProgressEvent),
     SearchJobStarted(SearchJobRecord),
     SearchJobCompleted(SearchJobCompletedEvent),
     SearchJobFailed(SearchJobFailedEvent),
@@ -129,11 +105,8 @@ pub enum CoreEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreEventKind {
-    PlaybackStateChanged,
-    AudioSettingsChanged,
-    PlaybackTrackChanged,
-    PlaybackPositionUpdated,
-    QueueUpdated,
+    StateUpdated,
+    PlaybackProgress,
     SearchJobStarted,
     SearchJobCompleted,
     SearchJobFailed,
@@ -143,11 +116,8 @@ pub enum CoreEventKind {
 impl Display for CoreEventKind {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = match self {
-            Self::PlaybackStateChanged => "playback.state.changed",
-            Self::AudioSettingsChanged => "audio.settings.changed",
-            Self::PlaybackTrackChanged => "playback.track.changed",
-            Self::PlaybackPositionUpdated => "playback.position.updated",
-            Self::QueueUpdated => "queue.updated",
+            Self::StateUpdated => "state.updated",
+            Self::PlaybackProgress => "playback.progress",
             Self::SearchJobStarted => "search.job.started",
             Self::SearchJobCompleted => "search.job.completed",
             Self::SearchJobFailed => "search.job.failed",
