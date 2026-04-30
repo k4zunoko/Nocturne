@@ -38,11 +38,31 @@ pub enum PlaybackCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PlaybackStartStatus {
+    #[default]
+    Idle,
+    Pending {
+        queue_item_id: String,
+        position_ms: u64,
+    },
+    Ready {
+        queue_item_id: String,
+        position_ms: u64,
+    },
+    Failed {
+        queue_item_id: String,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LocalPlaybackSnapshot {
     pub current_item: Option<QueueItem>,
     pub position_ms: u64,
     pub paused: bool,
     pub finished_queue_item_id: Option<String>,
+    pub start_status: PlaybackStartStatus,
     pub history: Vec<PlaybackCommand>,
 }
 
@@ -103,10 +123,9 @@ impl LocalPlaybackAdapter {
 
 impl PlaybackPort for LocalPlaybackAdapter {
     fn start(&mut self, item: &QueueItem, position_ms: u64) -> Result<(), PortError> {
-        self.request(|reply| WorkerCommand::Start {
+        self.send_command(WorkerCommand::Start {
             item: item.clone(),
             position_ms,
-            reply,
         })
     }
 
@@ -140,7 +159,6 @@ enum WorkerCommand {
     Start {
         item: QueueItem,
         position_ms: u64,
-        reply: SyncSender<Result<(), PortError>>,
     },
     Pause {
         reply: SyncSender<Result<(), PortError>>,
@@ -163,23 +181,18 @@ enum ActivePlayback {
     Rodio {
         queue_item_id: String,
         _sink: MixerDeviceSink,
-        _runtime: Runtime,
         player: Player,
     },
 }
 
 fn playback_worker_loop(receiver: mpsc::Receiver<WorkerCommand>, state: SharedPlaybackState) {
     let mut active = None;
+    let mut playback_runtime = None;
 
     loop {
         match receiver.recv_timeout(WORKER_POLL_INTERVAL) {
-            Ok(WorkerCommand::Start {
-                item,
-                position_ms,
-                reply,
-            }) => {
-                let result = handle_start(&state, &mut active, item, position_ms);
-                let _ = reply.send(result);
+            Ok(WorkerCommand::Start { item, position_ms }) => {
+                handle_start(&state, &mut active, &mut playback_runtime, item, position_ms);
             }
             Ok(WorkerCommand::Pause { reply }) => {
                 let _ = reply.send(handle_pause(&state, &active));
@@ -205,15 +218,39 @@ fn playback_worker_loop(receiver: mpsc::Receiver<WorkerCommand>, state: SharedPl
 fn handle_start(
     state: &SharedPlaybackState,
     active: &mut Option<ActivePlayback>,
+    playback_runtime: &mut Option<Runtime>,
     item: QueueItem,
     position_ms: u64,
-) -> Result<(), PortError> {
+) {
     clear_active_playback(state, active, false);
+
+    {
+        let mut snapshot = recover_lock(&state.inner);
+        snapshot.start_status = PlaybackStartStatus::Pending {
+            queue_item_id: item.id.clone(),
+            position_ms,
+        };
+    }
 
     let next_active = if should_simulate_source(&item.song.source_url) {
         ActivePlayback::Simulated
     } else {
-        open_real_playback(&item, position_ms)?
+        match open_real_playback(&item, position_ms, playback_runtime) {
+            Ok(active_playback) => active_playback,
+            Err(error) => {
+                let mut snapshot = recover_lock(&state.inner);
+                snapshot.current_item = None;
+                snapshot.position_ms = 0;
+                snapshot.paused = false;
+                snapshot.finished_queue_item_id = None;
+                snapshot.start_status = PlaybackStartStatus::Failed {
+                    queue_item_id: item.id.clone(),
+                    code: error.code().to_owned(),
+                    message: error.message().to_owned(),
+                };
+                return;
+            }
+        }
     };
 
     {
@@ -226,10 +263,13 @@ fn handle_start(
             queue_item_id: item.id.clone(),
             position_ms,
         });
+        snapshot.start_status = PlaybackStartStatus::Ready {
+            queue_item_id: item.id.clone(),
+            position_ms,
+        };
     }
 
     *active = Some(next_active);
-    Ok(())
 }
 
 fn handle_pause(
@@ -342,12 +382,17 @@ fn clear_active_playback(
     snapshot.position_ms = 0;
     snapshot.paused = false;
     snapshot.finished_queue_item_id = None;
+    snapshot.start_status = PlaybackStartStatus::Idle;
     if record_stop {
         snapshot.history.push(PlaybackCommand::Stop);
     }
 }
 
-fn open_real_playback(item: &QueueItem, position_ms: u64) -> Result<ActivePlayback, PortError> {
+fn open_real_playback(
+    item: &QueueItem,
+    position_ms: u64,
+    playback_runtime: &mut Option<Runtime>,
+) -> Result<ActivePlayback, PortError> {
     let sink = DeviceSinkBuilder::open_default_sink().map_err(|error| {
         PortError::new(
             "audio_output_unavailable",
@@ -357,16 +402,7 @@ fn open_real_playback(item: &QueueItem, position_ms: u64) -> Result<ActivePlayba
     let player = Player::connect_new(sink.mixer());
 
     let playback_url = resolve_playback_url(&item.song.source_url)?;
-    let runtime = RuntimeBuilder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .map_err(|error| {
-            PortError::new(
-                "playback_runtime_failed",
-                format!("failed to build playback runtime: {error}"),
-            )
-        })?;
+    let runtime = playback_runtime_instance(playback_runtime)?;
 
     let reader = runtime.block_on(async {
         let stream_url = playback_url.parse().map_err(|error| {
@@ -408,9 +444,29 @@ fn open_real_playback(item: &QueueItem, position_ms: u64) -> Result<ActivePlayba
     Ok(ActivePlayback::Rodio {
         queue_item_id: item.id.clone(),
         _sink: sink,
-        _runtime: runtime,
         player,
     })
+}
+
+fn playback_runtime_instance(playback_runtime: &mut Option<Runtime>) -> Result<&Runtime, PortError> {
+    if playback_runtime.is_none() {
+        *playback_runtime = Some(
+            RuntimeBuilder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    PortError::new(
+                        "playback_runtime_failed",
+                        format!("failed to build playback runtime: {error}"),
+                    )
+                })?,
+        );
+    }
+
+    Ok(playback_runtime
+        .as_ref()
+        .expect("playback runtime should be initialized"))
 }
 
 fn resolve_playback_url(source_url: &str) -> Result<String, PortError> {
@@ -639,6 +695,7 @@ mod tests {
         let mut adapter = LocalPlaybackAdapter::new(shared.clone());
 
         adapter.start(&queue_item("queue_item_1"), 0).unwrap();
+        thread::sleep(Duration::from_millis(20));
         adapter.seek(42_000).unwrap();
         adapter.pause().unwrap();
         adapter.resume().unwrap();
@@ -647,6 +704,10 @@ mod tests {
         assert_eq!(snapshot.position_ms, 42_000);
         assert!(!snapshot.paused);
         assert_eq!(snapshot.history.len(), 4);
+        assert!(matches!(
+            snapshot.start_status,
+            PlaybackStartStatus::Ready { .. }
+        ));
     }
 
     #[test]
@@ -655,12 +716,14 @@ mod tests {
         let mut adapter = LocalPlaybackAdapter::new(shared.clone());
 
         adapter.start(&queue_item("queue_item_1"), 1_500).unwrap();
+        thread::sleep(Duration::from_millis(20));
         adapter.stop().unwrap();
 
         let snapshot = shared.snapshot();
         assert!(snapshot.current_item.is_none());
         assert_eq!(snapshot.position_ms, 0);
         assert_eq!(snapshot.history.len(), 2);
+        assert_eq!(snapshot.start_status, PlaybackStartStatus::Idle);
     }
 
     #[test]

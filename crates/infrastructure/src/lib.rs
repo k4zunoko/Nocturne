@@ -7,7 +7,10 @@ mod search;
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Mutex, MutexGuard};
 
-pub use audio::{LocalPlaybackAdapter, LocalPlaybackSnapshot, PlaybackCommand, SharedPlaybackState};
+pub use audio::{
+    LocalPlaybackAdapter, LocalPlaybackSnapshot, PlaybackCommand, PlaybackStartStatus,
+    SharedPlaybackState,
+};
 pub use clock::LocalClock;
 pub use events::{BroadcastEventPublisher, EventCursorError, LocalEventLog, LocalEventPublisher};
 pub use ids::LocalIdGenerator;
