@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use nocturne_domain::{PlaybackState, QueueItem, Song};
+use nocturne_domain::{AudioSettings, PlaybackState, QueueItem, Song};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -74,6 +74,7 @@ pub struct HealthResponse {
 pub struct StateSnapshot {
     pub backend: BackendStatus,
     pub playback: PlaybackState,
+    pub audio: AudioSettings,
     pub current_song: Option<Song>,
     pub queue: Vec<QueueItem>,
     pub search_jobs: Vec<SearchJobSummary>,
@@ -153,6 +154,12 @@ pub struct PlaybackSeekRequest {
     pub position_ms: DurationMs,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybackVolumeRequest {
+    pub volume_percent: u8,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum QueueUpdateReason {
@@ -219,6 +226,7 @@ pub struct SystemError {
 #[serde(rename_all = "snake_case")]
 pub enum EventName {
     PlaybackStateChanged,
+    AudioSettingsChanged,
     PlaybackTrackChanged,
     PlaybackPositionUpdated,
     QueueUpdated,
@@ -232,6 +240,7 @@ impl Display for EventName {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let name = match self {
             Self::PlaybackStateChanged => "playback.state.changed",
+            Self::AudioSettingsChanged => "audio.settings.changed",
             Self::PlaybackTrackChanged => "playback.track.changed",
             Self::PlaybackPositionUpdated => "playback.position.updated",
             Self::QueueUpdated => "queue.updated",
@@ -270,6 +279,8 @@ impl<T> EventEnvelope<T> {
 pub enum ServerEvent {
     #[serde(rename = "playback.state.changed")]
     PlaybackStateChanged(PlaybackStateChanged),
+    #[serde(rename = "audio.settings.changed")]
+    AudioSettingsChanged(AudioSettings),
     #[serde(rename = "playback.track.changed")]
     PlaybackTrackChanged(PlaybackTrackChanged),
     #[serde(rename = "playback.position.updated")]
