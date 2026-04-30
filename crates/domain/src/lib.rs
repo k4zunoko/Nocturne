@@ -1,5 +1,42 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AudioSettings {
+    pub volume_percent: u8,
+}
+
+impl AudioSettings {
+    pub const DEFAULT_VOLUME_PERCENT: u8 = 50;
+
+    #[must_use]
+    pub const fn new(volume_percent: u8) -> Self {
+        Self { volume_percent }
+    }
+
+    #[must_use]
+    pub const fn clamped(self) -> Self {
+        Self {
+            volume_percent: if self.volume_percent > 100 {
+                100
+            } else {
+                self.volume_percent
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn gain(self) -> f32 {
+        f32::from(self.clamped().volume_percent) / 100.0
+    }
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_VOLUME_PERCENT)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Song {
     pub id: String,
