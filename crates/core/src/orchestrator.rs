@@ -512,6 +512,13 @@ where
             ));
         }
 
+        if self.state.playback.state == PlaybackStatus::Loading {
+            return Err(CoreError::conflict(
+                "playback_start_in_progress",
+                "cannot seek while a track is still loading",
+            ));
+        }
+
         self.playback.seek(position_ms)?;
         self.note_position(position_ms)?;
         self.command_accepted(None, None)
@@ -546,6 +553,52 @@ where
         }
 
         Ok(())
+    }
+
+    pub fn confirm_playback_started(
+        &mut self,
+        queue_item_id: &str,
+        position_ms: u64,
+    ) -> Result<bool, CoreError> {
+        if self.state.playback.state != PlaybackStatus::Loading
+            || self.state.playback.current_queue_item_id.as_deref() != Some(queue_item_id)
+        {
+            return Ok(false);
+        }
+
+        self.state.playback.state = PlaybackStatus::Playing;
+        self.state.playback.position_ms = position_ms;
+
+        if let Some(current_index) = self.current_index() {
+            self.apply_queue_statuses(Some(current_index), QueueItemStatus::Playing);
+        }
+
+        self.publish_playback_state_changed()?;
+        self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+        Ok(true)
+    }
+
+    pub fn report_playback_start_failed(
+        &mut self,
+        queue_item_id: &str,
+    ) -> Result<bool, CoreError> {
+        if self.state.playback.state != PlaybackStatus::Loading
+            || self.state.playback.current_queue_item_id.as_deref() != Some(queue_item_id)
+        {
+            return Ok(false);
+        }
+
+        self.state.playback.state = PlaybackStatus::Stopped;
+        self.state.playback.position_ms = 0;
+        self.state.playback.current_queue_item_id = None;
+
+        if let Some(queue_item) = self.state.queue.iter_mut().find(|item| item.id == queue_item_id) {
+            queue_item.status = QueueItemStatus::Failed;
+        }
+
+        self.publish_playback_state_changed()?;
+        self.publish_queue_updated(QueueUpdateReason::CurrentChanged)?;
+        Ok(true)
     }
 
     pub fn emit_system_error(
@@ -605,13 +658,7 @@ where
             return Err(error.into());
         }
 
-        self.state.playback.state = PlaybackStatus::Playing;
-        self.state.playback.position_ms = position_ms;
-        self.state.playback.current_queue_item_id = Some(item.id.clone());
-        self.apply_queue_statuses(Some(index), QueueItemStatus::Playing);
-
-        self.publish_playback_state_changed()?;
-        self.publish_queue_updated(QueueUpdateReason::CurrentChanged)
+        Ok(())
     }
 
     fn publish_playback_state_changed(&mut self) -> Result<(), CoreError> {
@@ -856,13 +903,20 @@ mod tests {
         orchestrator.enqueue_song(song("song_1")).unwrap();
 
         assert_eq!(orchestrator.queue().len(), 1);
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Playing);
+        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Loading);
         assert_eq!(
             orchestrator.state().playback().current_queue_item_id.as_deref(),
             Some("queue_item_0001")
         );
-        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Loading);
         assert_eq!(orchestrator.playback.started, vec!["queue_item_0001@0"]);
+
+        orchestrator
+            .confirm_playback_started("queue_item_0001", 0)
+            .unwrap();
+
+        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Playing);
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
     }
 
     #[test]
@@ -881,6 +935,9 @@ mod tests {
             .playback()
             .current_queue_item_id
             .clone()
+            .unwrap();
+        orchestrator
+            .confirm_playback_started(&first_queue_item_id, 0)
             .unwrap();
         orchestrator.pause().unwrap();
 
@@ -932,8 +989,10 @@ mod tests {
         let accepted = orchestrator.submit_search("utada traveling").unwrap();
         let job_id = accepted.job_id.clone().unwrap();
         orchestrator.complete_search(&job_id, vec![song("song_1")]).unwrap();
-        orchestrator.enqueue_song_by_id("song_1").unwrap();
-        orchestrator.play().unwrap();
+        let queue_item_id = orchestrator.enqueue_song_by_id("song_1").unwrap().queue_item_id.unwrap();
+        orchestrator
+            .confirm_playback_started(&queue_item_id, 0)
+            .unwrap();
         orchestrator.seek(12_345).unwrap();
         orchestrator.stop().unwrap();
 
@@ -960,9 +1019,11 @@ mod tests {
             .unwrap()
             .queue_item_id
             .unwrap();
-        orchestrator.play().unwrap();
 
         orchestrator.finish_current_track().unwrap();
+        orchestrator
+            .confirm_playback_started(&second_queue_item_id, 0)
+            .unwrap();
 
         assert_eq!(orchestrator.queue().len(), 1);
         assert_eq!(orchestrator.queue()[0].song.id, "song_2");
@@ -984,10 +1045,17 @@ mod tests {
         );
 
         orchestrator.enqueue_song(song("song_1")).unwrap();
-        orchestrator.enqueue_song(song("song_2")).unwrap();
-        orchestrator.play().unwrap();
+        let second_queue_item_id = orchestrator
+            .enqueue_song(song("song_2"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
 
         orchestrator.next().unwrap();
+        orchestrator
+            .confirm_playback_started(&second_queue_item_id, 0)
+            .unwrap();
 
         assert_eq!(orchestrator.queue().len(), 1);
         assert_eq!(orchestrator.queue()[0].song.id, "song_2");
@@ -1005,10 +1073,13 @@ mod tests {
         );
 
         orchestrator.enqueue_song(song("song_1")).unwrap();
-        orchestrator.play().unwrap();
+        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
         orchestrator.seek(12_345).unwrap();
 
         orchestrator.previous().unwrap();
+        orchestrator
+            .confirm_playback_started("queue_item_0001", 0)
+            .unwrap();
 
         assert_eq!(orchestrator.queue().len(), 1);
         assert_eq!(orchestrator.queue()[0].song.id, "song_1");
@@ -1028,7 +1099,7 @@ mod tests {
 
         let first_id = orchestrator.enqueue_song(song("song_1")).unwrap().queue_item_id.unwrap();
         let second_id = orchestrator.enqueue_song(song("song_2")).unwrap().queue_item_id.unwrap();
-        orchestrator.play().unwrap();
+        orchestrator.confirm_playback_started(&first_id, 0).unwrap();
 
         let error = orchestrator.move_queue_item(&second_id, 0).unwrap_err();
 
@@ -1054,7 +1125,7 @@ mod tests {
         );
 
         orchestrator.enqueue_song(song("song_1")).unwrap();
-        orchestrator.play().unwrap();
+        orchestrator.confirm_playback_started("queue_item_0001", 0).unwrap();
 
         let error = orchestrator.remove_queue_item("queue_item_0001").unwrap_err();
 
@@ -1115,5 +1186,73 @@ mod tests {
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Failed);
         assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Stopped);
         assert_eq!(orchestrator.state().playback().current_queue_item_id, None);
+    }
+
+    #[test]
+    fn playback_start_is_confirmed_explicitly_after_loading() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        let queue_item_id = orchestrator.enqueue_song(song("song_1")).unwrap().queue_item_id.unwrap();
+
+        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Loading);
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Loading);
+
+        orchestrator
+            .confirm_playback_started(&queue_item_id, 321)
+            .unwrap();
+
+        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Playing);
+        assert_eq!(orchestrator.state().playback().position_ms, 321);
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+    }
+
+    #[test]
+    fn playback_start_failure_marks_current_item_failed() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        let queue_item_id = orchestrator.enqueue_song(song("song_1")).unwrap().queue_item_id.unwrap();
+
+        orchestrator
+            .report_playback_start_failed(&queue_item_id)
+            .unwrap();
+
+        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Stopped);
+        assert_eq!(orchestrator.state().playback().current_queue_item_id, None);
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Failed);
+    }
+
+    #[test]
+    fn seek_is_rejected_while_playback_is_loading() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.enqueue_song(song("song_1")).unwrap();
+
+        let error = orchestrator.seek(123).unwrap_err();
+
+        match error {
+            CoreError::Conflict { code, message } => {
+                assert_eq!(code, "playback_start_in_progress");
+                assert_eq!(message, "cannot seek while a track is still loading");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
     }
 }
