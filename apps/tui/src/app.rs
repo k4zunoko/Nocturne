@@ -299,15 +299,15 @@ impl App {
         let layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(6),
+                Constraint::Length(5),
                 Constraint::Length(4),
                 Constraint::Min(6),
                 Constraint::Length(3),
-                Constraint::Length(2),
+                Constraint::Length(1),
             ])
             .split(area);
 
-        frame.render_widget(self.now_playing_widget(), layout[0]);
+        self.render_now_playing_widget(frame, layout[0]);
         frame.render_widget(self.search_input_widget(), layout[1]);
         frame.render_widget(self.queue_summary_widget(), layout[2]);
         frame.render_widget(self.status_widget(), layout[3]);
@@ -766,7 +766,7 @@ impl App {
         position_ms.min(duration_ms)
     }
 
-    fn now_playing_widget(&self) -> Paragraph<'static> {
+    fn render_now_playing_widget(&self, frame: &mut Frame<'_>, area: Rect) {
         let title = self.current_song.as_ref().map_or_else(
             || String::from("Nothing queued yet"),
             |song| song.title.clone(),
@@ -785,34 +785,99 @@ impl App {
             .current_song
             .as_ref()
             .map_or(1, |song| song.duration_ms.max(1));
+        let block = Block::default().title("Playback").borders(Borders::ALL);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
 
-        let lines = vec![
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+
+        let state_style = match self.playback.state {
+            PlaybackStatus::Stopped => Style::default().fg(Color::Gray),
+            PlaybackStatus::Loading => Style::default().fg(Color::Yellow),
+            PlaybackStatus::Playing => Style::default().fg(Color::LightGreen),
+            PlaybackStatus::Paused => Style::default().fg(Color::Yellow),
+        };
+        let state_width = text_width(state_label);
+        let volume_label = format!("Vol {}%", self.audio.volume_percent);
+        let volume_width = text_width(&volume_label);
+        let time_label = format!(
+            "{} / {}",
+            format_duration(self.display_position_ms),
+            format_duration(duration_ms)
+        );
+
+        let title_row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(state_width),
+            ])
+            .split(rows[0]);
+        frame.render_widget(
             Line::from(vec![
-                Span::styled(
-                    "Now Playing ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("Title ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(title),
             ]),
-            Line::from(channel),
-            Line::from(format!(
-                "{}  {} / {}",
-                state_label,
-                format_duration(self.display_position_ms),
-                format_duration(duration_ms)
-            )),
-            Line::from(format!(
-                "Volume {}% {}",
-                self.audio.volume_percent,
-                progress_bar(u64::from(self.audio.volume_percent), 100, 16)
-            )),
-            Line::from(progress_bar(self.display_position_ms, duration_ms, 32)),
-            Line::from(String::new()),
-        ];
+            title_row[0],
+        );
+        frame.render_widget(
+            Paragraph::new(Line::styled(state_label, state_style).right_aligned()),
+            title_row[2],
+        );
 
-        Paragraph::new(lines)
-            .block(Block::default().title("Playback").borders(Borders::ALL))
-            .wrap(Wrap { trim: true })
+        let channel_row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(volume_width),
+            ])
+            .split(rows[1]);
+        frame.render_widget(
+            Line::from(vec![
+                Span::styled("Channel ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(channel, Style::default().fg(Color::Gray)),
+            ]),
+            channel_row[0],
+        );
+        frame.render_widget(
+            Paragraph::new(
+                Line::from(vec![
+                    Span::styled("Vol ", Style::default().fg(Color::Gray)),
+                    Span::raw(format!("{}%", self.audio.volume_percent)),
+                ])
+                .right_aligned(),
+            ),
+            channel_row[2],
+        );
+
+        let reserved_time_width = text_width(&time_label).saturating_add(1).min(rows[2].width);
+        let progress_row = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(reserved_time_width), Constraint::Min(0)])
+            .split(rows[2]);
+        frame.render_widget(Line::from(format!("{time_label} ")), progress_row[0],);
+        frame.render_widget(
+            Line::from(progress_bar_spans(
+                self.display_position_ms,
+                duration_ms,
+                usize::from(progress_row[1].width),
+            )),
+            progress_row[1],
+        );
     }
 
     fn search_input_widget(&self) -> Paragraph<'static> {
@@ -1279,16 +1344,26 @@ fn format_duration(duration_ms: u64) -> String {
     format!("{minutes}:{seconds:02}")
 }
 
-fn progress_bar(position_ms: u64, duration_ms: u64, width: usize) -> String {
+fn progress_bar_spans(position_ms: u64, duration_ms: u64, width: usize) -> Vec<Span<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
     let safe_duration = duration_ms.max(1);
     let filled = ((position_ms.min(safe_duration) as f64 / safe_duration as f64) * width as f64)
         .round() as usize;
     let filled = filled.min(width);
-    format!(
-        "[{}{}]",
-        "█".repeat(filled),
-        "·".repeat(width.saturating_sub(filled))
-    )
+    vec![
+        Span::styled("━".repeat(filled), Style::default().fg(Color::White)),
+        Span::styled(
+            "─".repeat(width.saturating_sub(filled)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]
+}
+
+fn text_width(text: &str) -> u16 {
+    text.chars().count().min(usize::from(u16::MAX)) as u16
 }
 
 #[cfg(test)]
@@ -1672,6 +1747,19 @@ mod tests {
         assert_eq!(app.playback.playback_session_id.as_deref(), Some("session_1"));
         assert_eq!(app.playback.position_ms, 500);
         assert!(!app.playback_progress_confirmed);
+    }
+
+    #[test]
+    fn progress_bar_spans_use_thin_glyphs() {
+        let spans = progress_bar_spans(50, 100, 6);
+
+        assert_eq!(spans[0].content.as_ref(), "━━━");
+        assert_eq!(spans[1].content.as_ref(), "───");
+    }
+
+    #[test]
+    fn text_width_counts_display_columns_for_ascii_labels() {
+        assert_eq!(text_width("Vol 68%"), 7);
     }
 
     #[test]
