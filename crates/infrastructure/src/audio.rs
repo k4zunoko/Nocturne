@@ -7,7 +7,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nocturne_core::{PlaybackPort, PortError};
-use nocturne_domain::QueueItem;
+use nocturne_domain::{AudioSettings, QueueItem};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
@@ -18,8 +18,7 @@ use crate::recover_lock;
 const DEFAULT_YT_DLP_BINARY: &str = "yt-dlp";
 const DEFAULT_WINDOWS_YT_DLP_PATH: &str = r"C:\tools\yt-dlp\yt-dlp.exe";
 const YT_DLP_PATH_ENV: &str = "NOCTURNE_YT_DLP_PATH";
-const YT_DLP_AUDIO_FORMAT: &str =
-    "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
+const YT_DLP_AUDIO_FORMAT: &str = "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
 const YT_DLP_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -34,6 +33,9 @@ pub enum PlaybackCommand {
     Stop,
     Seek {
         position_ms: u64,
+    },
+    SetVolume {
+        volume_percent: u8,
     },
 }
 
@@ -56,14 +58,29 @@ pub enum PlaybackStartStatus {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPlaybackSnapshot {
     pub current_item: Option<QueueItem>,
     pub position_ms: u64,
     pub paused: bool,
     pub finished_queue_item_id: Option<String>,
     pub start_status: PlaybackStartStatus,
+    pub volume_percent: u8,
     pub history: Vec<PlaybackCommand>,
+}
+
+impl Default for LocalPlaybackSnapshot {
+    fn default() -> Self {
+        Self {
+            current_item: None,
+            position_ms: 0,
+            paused: false,
+            finished_queue_item_id: None,
+            start_status: PlaybackStartStatus::Idle,
+            volume_percent: AudioSettings::DEFAULT_VOLUME_PERCENT,
+            history: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -129,6 +146,14 @@ impl PlaybackPort for LocalPlaybackAdapter {
         })
     }
 
+    fn set_volume(&mut self, gain: f32) -> Result<(), PortError> {
+        let volume_percent = gain_to_percent(gain);
+        self.request(|reply| WorkerCommand::SetVolume {
+            volume_percent,
+            reply,
+        })
+    }
+
     fn pause(&mut self) -> Result<(), PortError> {
         self.request(|reply| WorkerCommand::Pause { reply })
     }
@@ -173,6 +198,10 @@ enum WorkerCommand {
         position_ms: u64,
         reply: SyncSender<Result<(), PortError>>,
     },
+    SetVolume {
+        volume_percent: u8,
+        reply: SyncSender<Result<(), PortError>>,
+    },
     Shutdown,
 }
 
@@ -188,11 +217,26 @@ enum ActivePlayback {
 fn playback_worker_loop(receiver: mpsc::Receiver<WorkerCommand>, state: SharedPlaybackState) {
     let mut active = None;
     let mut playback_runtime = None;
+    let mut volume_percent = AudioSettings::DEFAULT_VOLUME_PERCENT;
 
     loop {
         match receiver.recv_timeout(WORKER_POLL_INTERVAL) {
             Ok(WorkerCommand::Start { item, position_ms }) => {
-                handle_start(&state, &mut active, &mut playback_runtime, item, position_ms);
+                handle_start(
+                    &state,
+                    &mut active,
+                    &mut playback_runtime,
+                    item,
+                    position_ms,
+                    volume_percent,
+                );
+            }
+            Ok(WorkerCommand::SetVolume {
+                volume_percent: next_volume_percent,
+                reply,
+            }) => {
+                volume_percent = next_volume_percent;
+                let _ = reply.send(handle_set_volume(&state, &active, volume_percent));
             }
             Ok(WorkerCommand::Pause { reply }) => {
                 let _ = reply.send(handle_pause(&state, &active));
@@ -221,6 +265,7 @@ fn handle_start(
     playback_runtime: &mut Option<Runtime>,
     item: QueueItem,
     position_ms: u64,
+    volume_percent: u8,
 ) {
     clear_active_playback(state, active, false);
 
@@ -235,7 +280,7 @@ fn handle_start(
     let next_active = if should_simulate_source(&item.song.source_url) {
         ActivePlayback::Simulated
     } else {
-        match open_real_playback(&item, position_ms, playback_runtime) {
+        match open_real_playback(&item, position_ms, playback_runtime, volume_percent) {
             Ok(active_playback) => active_playback,
             Err(error) => {
                 let mut snapshot = recover_lock(&state.inner);
@@ -258,6 +303,7 @@ fn handle_start(
         snapshot.current_item = Some(item.clone());
         snapshot.position_ms = position_ms;
         snapshot.paused = false;
+        snapshot.volume_percent = volume_percent;
         snapshot.finished_queue_item_id = None;
         snapshot.history.push(PlaybackCommand::Start {
             queue_item_id: item.id.clone(),
@@ -283,6 +329,23 @@ fn handle_pause(
     let mut snapshot = recover_lock(&state.inner);
     snapshot.paused = true;
     snapshot.history.push(PlaybackCommand::Pause);
+    Ok(())
+}
+
+fn handle_set_volume(
+    state: &SharedPlaybackState,
+    active: &Option<ActivePlayback>,
+    volume_percent: u8,
+) -> Result<(), PortError> {
+    if let Some(ActivePlayback::Rodio { player, .. }) = active.as_ref() {
+        player.set_volume(percent_to_gain(volume_percent));
+    }
+
+    let mut snapshot = recover_lock(&state.inner);
+    snapshot.volume_percent = volume_percent;
+    snapshot
+        .history
+        .push(PlaybackCommand::SetVolume { volume_percent });
     Ok(())
 }
 
@@ -392,6 +455,7 @@ fn open_real_playback(
     item: &QueueItem,
     position_ms: u64,
     playback_runtime: &mut Option<Runtime>,
+    volume_percent: u8,
 ) -> Result<ActivePlayback, PortError> {
     let sink = DeviceSinkBuilder::open_default_sink().map_err(|error| {
         PortError::new(
@@ -429,6 +493,7 @@ fn open_real_playback(
         )
     })?;
     player.append(decoder);
+    player.set_volume(percent_to_gain(volume_percent));
 
     if position_ms > 0 {
         player
@@ -448,7 +513,9 @@ fn open_real_playback(
     })
 }
 
-fn playback_runtime_instance(playback_runtime: &mut Option<Runtime>) -> Result<&Runtime, PortError> {
+fn playback_runtime_instance(
+    playback_runtime: &mut Option<Runtime>,
+) -> Result<&Runtime, PortError> {
     if playback_runtime.is_none() {
         *playback_runtime = Some(
             RuntimeBuilder::new_multi_thread()
@@ -599,6 +666,14 @@ fn yt_dlp_executable() -> std::ffi::OsString {
     DEFAULT_YT_DLP_BINARY.into()
 }
 
+fn percent_to_gain(volume_percent: u8) -> f32 {
+    f32::from(volume_percent.min(100)) / 100.0
+}
+
+fn gain_to_percent(gain: f32) -> u8 {
+    (gain.clamp(0.0, 1.0) * 100.0).round() as u8
+}
+
 fn map_yt_dlp_spawn_error(error: std::io::Error) -> PortError {
     let code = if error.kind() == std::io::ErrorKind::NotFound {
         "yt_dlp_missing"
@@ -735,7 +810,9 @@ mod tests {
     #[test]
     fn fixture_like_urls_stay_simulated() {
         assert!(!is_real_playback_source("https://example.com/queue_item_1"));
-        assert!(!is_real_playback_source("https://www.youtube.com/watch?v=current-song"));
+        assert!(!is_real_playback_source(
+            "https://www.youtube.com/watch?v=current-song"
+        ));
         assert!(is_real_playback_source(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         ));
