@@ -10,7 +10,9 @@ use backend::{
 };
 use crossterm::event::{Event, EventStream};
 use crossterm::execute;
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -105,7 +107,9 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>, io::Error>
     Terminal::new(backend)
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), io::Error> {
+fn restore_terminal(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), io::Error> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()

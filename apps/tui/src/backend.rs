@@ -9,12 +9,13 @@ use std::time::Duration;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use nocturne_api::{
-    CommandAccepted, EmptyPayload, EventEnvelope, PlaybackPositionUpdated, PlaybackStateChanged,
-    PlaybackTrackChanged, ProblemDetails, QueueAddRequest, QueueRemoveRequest, QueueUpdated,
-    SearchCommandRequest, SearchJobCompleted, SearchJobFailed, SearchJobSummary,
-    SearchResultsResponse, StateSnapshot, SystemError, CURRENT_EVENT_ID_HEADER, EVENTS_PATH,
-    HEALTH_PATH, LAST_EVENT_ID_HEADER, STATE_PATH,
+    CURRENT_EVENT_ID_HEADER, CommandAccepted, EVENTS_PATH, EmptyPayload, EventEnvelope,
+    HEALTH_PATH, LAST_EVENT_ID_HEADER, PlaybackPositionUpdated, PlaybackStateChanged,
+    PlaybackTrackChanged, PlaybackVolumeRequest, ProblemDetails, QueueAddRequest,
+    QueueRemoveRequest, QueueUpdated, STATE_PATH, SearchCommandRequest, SearchJobCompleted,
+    SearchJobFailed, SearchJobSummary, SearchResultsResponse, StateSnapshot, SystemError,
 };
+use nocturne_domain::AudioSettings;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
@@ -22,8 +23,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::AppEvent;
 
-const EVENT_CURSOR_NOT_FOUND_TYPE: &str =
-    "https://nocturne.local/problems/event-cursor-not-found";
+const EVENT_CURSOR_NOT_FOUND_TYPE: &str = "https://nocturne.local/problems/event-cursor-not-found";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandAction {
@@ -32,6 +32,7 @@ pub enum CommandAction {
     PlayPause,
     Next,
     Previous,
+    SetVolume(u8),
     RemoveQueueItem(String),
 }
 
@@ -63,6 +64,7 @@ pub struct BackendEvent {
 #[derive(Debug, Clone)]
 pub enum BackendEventKind {
     PlaybackStateChanged(PlaybackStateChanged),
+    AudioSettingsChanged(AudioSettings),
     PlaybackTrackChanged(PlaybackTrackChanged),
     PlaybackPositionUpdated(PlaybackPositionUpdated),
     QueueUpdated(QueueUpdated),
@@ -131,11 +133,9 @@ impl ManagedBackend {
         let health_url = format!("http://{}{}", self.addr, HEALTH_PATH);
 
         for _attempt in 0..50 {
-            if let Some(status) = self
-                .child
-                .try_wait()
-                .map_err(|error| TuiError::new(format!("failed to inspect backend process: {error}")))?
-            {
+            if let Some(status) = self.child.try_wait().map_err(|error| {
+                TuiError::new(format!("failed to inspect backend process: {error}"))
+            })? {
                 return Err(TuiError::new(format!(
                     "backend exited before becoming ready: {status}"
                 )));
@@ -158,7 +158,9 @@ impl ManagedBackend {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        Err(TuiError::new("backend did not become ready within 5 seconds"))
+        Err(TuiError::new(
+            "backend did not become ready within 5 seconds",
+        ))
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -202,37 +204,55 @@ impl BackendClient {
     pub async fn send_command(&self, action: CommandAction) -> Result<CommandOutcome, String> {
         match action {
             CommandAction::Search(query) => self
-                .post_json("/api/v1/commands/search", &SearchCommandRequest {
-                    query: query.clone(),
-                })
+                .post_json(
+                    "/api/v1/commands/search",
+                    &SearchCommandRequest {
+                        query: query.clone(),
+                    },
+                )
                 .await
                 .and_then(|accepted| {
                     accepted
                         .job_id
                         .map(|job_id| CommandOutcome::SearchSubmitted { job_id, query })
                         .ok_or_else(|| {
-                            String::from(
-                                "search command was accepted but no job id was returned",
-                            )
+                            String::from("search command was accepted but no job id was returned")
                         })
                 }),
             CommandAction::AddSong(song_id) => self
                 .post_json("/api/v1/commands/queue/add", &QueueAddRequest { song_id })
                 .await
                 .map(|_| CommandOutcome::SongQueued(String::from("Added selection to queue."))),
-            CommandAction::PlayPause => {
-                self.post_json("/api/v1/commands/playback/play-pause", &EmptyPayload::default())
-                    .await
-                    .map(|_| CommandOutcome::StatusMessage(String::from("Playback toggle accepted.")))
-            }
+            CommandAction::PlayPause => self
+                .post_json(
+                    "/api/v1/commands/playback/play-pause",
+                    &EmptyPayload::default(),
+                )
+                .await
+                .map(|_| CommandOutcome::StatusMessage(String::from("Playback toggle accepted."))),
             CommandAction::Next => self
                 .post_json("/api/v1/commands/playback/next", &EmptyPayload::default())
                 .await
-                .map(|_| CommandOutcome::StatusMessage(String::from("Skip to next track accepted."))),
+                .map(|_| {
+                    CommandOutcome::StatusMessage(String::from("Skip to next track accepted."))
+                }),
             CommandAction::Previous => self
-                .post_json("/api/v1/commands/playback/previous", &EmptyPayload::default())
+                .post_json(
+                    "/api/v1/commands/playback/previous",
+                    &EmptyPayload::default(),
+                )
                 .await
-                .map(|_| CommandOutcome::StatusMessage(String::from("Restart current track accepted."))),
+                .map(|_| {
+                    CommandOutcome::StatusMessage(String::from("Restart current track accepted."))
+                }),
+            CommandAction::SetVolume(volume_percent) => {
+                self.post_json(
+                    "/api/v1/commands/playback/volume",
+                    &PlaybackVolumeRequest { volume_percent },
+                )
+                .await
+                .map(|_| CommandOutcome::StatusMessage(format!("Volume set to {volume_percent}%.")))
+            }
             CommandAction::RemoveQueueItem(queue_item_id) => self
                 .post_json(
                     "/api/v1/commands/queue/remove",
@@ -245,7 +265,12 @@ impl BackendClient {
 
     pub async fn fetch_search_results(&self, job_id: &str) -> SearchResultsOutcome {
         let path = format!("/api/v1/search/results/{job_id}");
-        let response = match self.http.get(format!("{}{}", self.base_url, path)).send().await {
+        let response = match self
+            .http
+            .get(format!("{}{}", self.base_url, path))
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(error) => {
                 return SearchResultsOutcome::Failed {
@@ -303,10 +328,9 @@ impl BackendClient {
                 .await
                 .map_err(|error| format!("command response from {path} was invalid: {error}"))
         } else {
-            let problem = response
-                .json::<ProblemDetails>()
-                .await
-                .map_err(|error| format!("request to {path} failed with undecodable error: {error}"))?;
+            let problem = response.json::<ProblemDetails>().await.map_err(|error| {
+                format!("request to {path} failed with undecodable error: {error}")
+            })?;
             Err(problem.detail)
         }
     }
@@ -330,7 +354,9 @@ impl BackendClient {
             .headers(headers)
             .send()
             .await
-            .map_err(|error| TuiError::new(format!("failed to connect to event stream: {error}")))?;
+            .map_err(|error| {
+                TuiError::new(format!("failed to connect to event stream: {error}"))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -364,11 +390,15 @@ impl BackendClient {
         let mut latest_event_id = last_event_id;
 
         while let Some(event) = stream.next().await {
-            let event = event
-                .map_err(|error| TuiError::new(format!("event stream error: {error}")))?;
-            let envelope = serde_json::from_str::<EventEnvelope<Value>>(&event.data).map_err(
-                |error| TuiError::new(format!("failed to decode SSE payload '{}': {error}", event.data)),
-            )?;
+            let event =
+                event.map_err(|error| TuiError::new(format!("event stream error: {error}")))?;
+            let envelope =
+                serde_json::from_str::<EventEnvelope<Value>>(&event.data).map_err(|error| {
+                    TuiError::new(format!(
+                        "failed to decode SSE payload '{}': {error}",
+                        event.data
+                    ))
+                })?;
 
             latest_event_id = Some(envelope.event_id.clone());
             if let Some(decoded) = decode_backend_event(envelope)?
@@ -445,6 +475,11 @@ pub fn spawn_search_results_task(
 fn decode_backend_event(envelope: EventEnvelope<Value>) -> Result<Option<BackendEvent>, TuiError> {
     let event_id = envelope.event_id;
     let kind = match envelope.event.as_str() {
+        "audio.settings.changed" => BackendEventKind::AudioSettingsChanged(
+            serde_json::from_value::<AudioSettings>(envelope.data).map_err(|error| {
+                TuiError::new(format!("failed to decode audio.settings.changed: {error}"))
+            })?,
+        ),
         "playback.state.changed" => BackendEventKind::PlaybackStateChanged(
             serde_json::from_value::<PlaybackStateChanged>(envelope.data).map_err(|error| {
                 TuiError::new(format!("failed to decode playback.state.changed: {error}"))
@@ -457,7 +492,9 @@ fn decode_backend_event(envelope: EventEnvelope<Value>) -> Result<Option<Backend
         ),
         "playback.position.updated" => BackendEventKind::PlaybackPositionUpdated(
             serde_json::from_value::<PlaybackPositionUpdated>(envelope.data).map_err(|error| {
-                TuiError::new(format!("failed to decode playback.position.updated: {error}"))
+                TuiError::new(format!(
+                    "failed to decode playback.position.updated: {error}"
+                ))
             })?,
         ),
         "queue.updated" => BackendEventKind::QueueUpdated(
@@ -551,7 +588,12 @@ fn backend_binary_candidates() -> Vec<PathBuf> {
         }
     }
     if let Ok(workspace_root) = workspace_root() {
-        candidates.push(workspace_root.join("target").join("debug").join(&executable_name));
+        candidates.push(
+            workspace_root
+                .join("target")
+                .join("debug")
+                .join(&executable_name),
+        );
     }
     candidates
 }
@@ -650,6 +692,7 @@ mod tests {
                     position_ms: 42_000,
                     current_queue_item_id: None,
                 },
+                audio: AudioSettings::default(),
                 current_song: None,
                 queue: Vec::new(),
                 search_jobs: Vec::new(),
