@@ -19,6 +19,7 @@ impl IdGeneratorPort for LocalIdGenerator {
             IdKind::Command => "cmd",
             IdKind::Event => "evt",
             IdKind::Snapshot => "snap",
+            IdKind::PlaybackSession => "playback_session",
             IdKind::QueueItem => "queue_item",
             IdKind::SearchJob => "job",
         };

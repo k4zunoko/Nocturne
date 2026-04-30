@@ -10,6 +10,7 @@ pub enum IdKind {
     Command,
     Event,
     Snapshot,
+    PlaybackSession,
     QueueItem,
     SearchJob,
 }
@@ -61,7 +62,12 @@ pub trait EventPublisherPort {
 }
 
 pub trait PlaybackPort {
-    fn start(&mut self, item: &QueueItem, position_ms: u64) -> Result<(), PortError>;
+    fn start(
+        &mut self,
+        item: &QueueItem,
+        playback_session_id: &str,
+        position_ms: u64,
+    ) -> Result<(), PortError>;
 
     fn set_volume(&mut self, gain: f32) -> Result<(), PortError>;
 
