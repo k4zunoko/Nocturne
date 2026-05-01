@@ -4,6 +4,7 @@ mod events;
 mod ids;
 mod search;
 mod settings;
+mod yt_dlp;
 
 use std::fmt::{self, Display, Formatter};
 use std::sync::{Mutex, MutexGuard};
@@ -17,6 +18,11 @@ pub use events::{BroadcastEventPublisher, EventCursorError, LocalEventLog, Local
 pub use ids::LocalIdGenerator;
 pub use search::{LocalSearchAdapter, LocalSearchFailure, LocalSearchRuntime, PendingSearchJob};
 pub use settings::LocalAudioSettingsStore;
+pub use yt_dlp::{
+    DEFAULT_WINDOWS_YT_DLP_PATH, LocalYtDlpManager, LocalYtDlpSettings, LocalYtDlpSettingsStore,
+    UpdateCheckResult, YT_DLP_COMMAND_TIMEOUT, YT_DLP_PATH_ENV, YT_DLP_UPDATE_INTERVAL,
+    YtDlpReleaseChannel,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InfrastructureProfile {
