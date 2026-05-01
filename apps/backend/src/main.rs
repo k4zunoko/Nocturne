@@ -18,8 +18,8 @@ use nocturne_api::{
     ApiVersion, BackendStatus, CommandAccepted, EmptyPayload, EventEnvelope, EventName,
     HealthResponse, PlaybackProgress, PlaybackSeekRequest, PlaybackVolumeRequest, ProblemDetails,
     QueueAddRequest, QueueMoveRequest, QueueRemoveRequest, QueueResponse, SearchCommandRequest,
-    SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus,
-    SearchJobSummary, SearchResultsResponse, StateSnapshot, SystemError, SystemErrorSeverity,
+    SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus, SearchJobSummary,
+    SearchResultsResponse, StateSnapshot, SystemError, SystemErrorSeverity,
 };
 use nocturne_core::{
     CoreError, CoreEvent, CoreEventEnvelope, CoreSnapshot, NocturneCore, Orchestrator,
@@ -30,12 +30,13 @@ use nocturne_domain::AudioSettings;
 use nocturne_infrastructure::{
     BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalAudioSettingsStore,
     LocalClock, LocalEventLog, LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter,
-    LocalSearchRuntime, PlaybackWorkerEvent, SharedPlaybackState,
+    LocalSearchRuntime, LocalYtDlpManager, LocalYtDlpSettingsStore, PlaybackWorkerEvent,
+    SharedPlaybackState,
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 type BackendOrchestrator = Orchestrator<
@@ -63,7 +64,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 128);
     let playback_state = SharedPlaybackState::default();
     let (playback_event_tx, playback_event_rx) = mpsc::unbounded_channel();
-    let search_runtime = LocalSearchRuntime::default();
+    let yt_dlp_manager =
+        LocalYtDlpManager::new(reqwest::Client::new(), LocalYtDlpSettingsStore::new()?);
+    yt_dlp_manager.prepare()?;
+    let search_runtime = LocalSearchRuntime::with_yt_dlp(yt_dlp_manager.clone());
     let settings_store = Arc::new(Mutex::new(LocalAudioSettingsStore::new()?));
     let initial_audio_settings = {
         let store = settings_store.lock().await;
@@ -80,14 +84,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LocalClock::new(),
         LocalIdGenerator::new(),
         event_publisher.clone(),
-        LocalPlaybackAdapter::new(playback_state.clone(), playback_event_tx.clone()),
+        LocalPlaybackAdapter::with_yt_dlp(
+            playback_state.clone(),
+            playback_event_tx.clone(),
+            yt_dlp_manager.clone(),
+        ),
         LocalSearchAdapter::new(search_runtime.clone()),
     );
     orchestrator.set_backend_version(Some(env!("CARGO_PKG_VERSION")));
+    orchestrator.set_yt_dlp_version(yt_dlp_manager.current_version());
     orchestrator.hydrate_audio_settings(initial_audio_settings)?;
 
     let snapshot = orchestrator.snapshot();
     let orchestrator = Arc::new(Mutex::new(orchestrator));
+    spawn_yt_dlp_update_worker(orchestrator.clone(), yt_dlp_manager.clone());
     spawn_search_worker(orchestrator.clone(), search_runtime.clone());
     spawn_playback_event_bridge(orchestrator.clone(), playback_event_rx);
     let state = AppState {
@@ -114,6 +124,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn spawn_yt_dlp_update_worker(
+    orchestrator: Arc<Mutex<BackendOrchestrator>>,
+    yt_dlp_manager: LocalYtDlpManager,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = yt_dlp_manager.check_for_updates_if_due().await {
+            eprintln!("failed to check for yt-dlp updates: {error}");
+            return;
+        }
+
+        match yt_dlp_manager.apply_pending_update() {
+            Ok(true) => {
+                let version = yt_dlp_manager.current_version();
+                let mut orchestrator = orchestrator.lock().await;
+                if let Err(error) = orchestrator.update_yt_dlp_version(version) {
+                    eprintln!("failed to publish yt-dlp version update: {error}");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("failed to promote yt-dlp update: {error}");
+            }
+        }
+    });
 }
 
 fn spawn_search_worker(
@@ -168,10 +204,9 @@ fn spawn_playback_event_bridge(
                     message,
                 }) => {
                     let mut orchestrator = orchestrator.lock().await;
-                    match orchestrator.report_playback_start_failed(
-                        &playback_session_id,
-                        &queue_item_id,
-                    ) {
+                    match orchestrator
+                        .report_playback_start_failed(&playback_session_id, &queue_item_id)
+                    {
                         Ok(true) => {
                             if let Err(error) = orchestrator.emit_system_error(
                                 code.clone(),
@@ -207,7 +242,8 @@ fn spawn_playback_event_bridge(
                         continue;
                     }
                     let mut orchestrator = orchestrator.lock().await;
-                    if let Err(error) = orchestrator.report_playback_progress(&playback_session_id, position_ms)
+                    if let Err(error) =
+                        orchestrator.report_playback_progress(&playback_session_id, position_ms)
                     {
                         eprintln!(
                             "failed to publish playback progress {} for session {}: {error}",
@@ -221,7 +257,8 @@ fn spawn_playback_event_bridge(
                     position_ms,
                 }) => {
                     let mut orchestrator = orchestrator.lock().await;
-                    if let Err(error) = orchestrator.finish_current_track(&playback_session_id, position_ms)
+                    if let Err(error) =
+                        orchestrator.finish_current_track(&playback_session_id, position_ms)
                     {
                         eprintln!(
                             "failed to advance playback after natural track end {}: {error}",
@@ -414,6 +451,7 @@ async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
         ok: true,
         ready: backend.ready,
         version: backend.version.clone(),
+        yt_dlp_version: backend.yt_dlp_version.clone(),
     })
 }
 
@@ -759,6 +797,7 @@ fn map_state_snapshot(snapshot: CoreSnapshot) -> StateSnapshot {
         backend: BackendStatus {
             ready: snapshot.backend.ready,
             version: snapshot.backend.version,
+            yt_dlp_version: snapshot.backend.yt_dlp_version,
         },
         playback: snapshot.playback,
         audio: snapshot.audio,
