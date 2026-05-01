@@ -113,6 +113,7 @@ impl App {
             backend: BackendStatus {
                 ready: false,
                 version: None,
+                yt_dlp_version: None,
             },
             playback: PlaybackState {
                 state: PlaybackStatus::Stopped,
@@ -869,7 +870,7 @@ impl App {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(reserved_time_width), Constraint::Min(0)])
             .split(rows[2]);
-        frame.render_widget(Line::from(format!("{time_label} ")), progress_row[0],);
+        frame.render_widget(Line::from(format!("{time_label} ")), progress_row[0]);
         frame.render_widget(
             Line::from(progress_bar_spans(
                 self.display_position_ms,
@@ -940,6 +941,11 @@ impl App {
             .version
             .clone()
             .unwrap_or_else(|| String::from("unknown"));
+        let yt_dlp_version = self
+            .backend
+            .yt_dlp_version
+            .clone()
+            .unwrap_or_else(|| String::from("unknown"));
         let readiness = if self.backend.ready {
             "ready"
         } else {
@@ -948,6 +954,9 @@ impl App {
         let message = Line::from(vec![
             Span::styled("Backend ", Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(format!("{} ({})", readiness, version)),
+            Span::raw("  •  "),
+            Span::styled("yt-dlp ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(yt_dlp_version),
             Span::raw("  •  "),
             Span::styled(self.status_message.clone(), Style::default().fg(color)),
         ]);
@@ -1618,6 +1627,7 @@ mod tests {
                 backend: BackendStatus {
                     ready: true,
                     version: Some(String::from("test")),
+                    yt_dlp_version: Some(String::from("2026.05.01")),
                 },
                 playback: PlaybackState {
                     state: PlaybackStatus::Stopped,
@@ -1661,6 +1671,7 @@ mod tests {
                 backend: BackendStatus {
                     ready: true,
                     version: Some(String::from("test")),
+                    yt_dlp_version: Some(String::from("2026.05.01")),
                 },
                 playback: PlaybackState {
                     state: PlaybackStatus::Stopped,
@@ -1700,6 +1711,7 @@ mod tests {
                 backend: BackendStatus {
                     ready: true,
                     version: Some(String::from("test")),
+                    yt_dlp_version: Some(String::from("2026.05.01")),
                 },
                 playback: PlaybackState {
                     state: PlaybackStatus::Playing,
@@ -1737,7 +1749,10 @@ mod tests {
             }),
         });
 
-        assert_eq!(app.playback.playback_session_id.as_deref(), Some("session_1"));
+        assert_eq!(
+            app.playback.playback_session_id.as_deref(),
+            Some("session_1")
+        );
         assert_eq!(app.playback.position_ms, 1_234);
         assert!(app.playback_progress_confirmed);
     }
@@ -1756,7 +1771,10 @@ mod tests {
             }),
         });
 
-        assert_eq!(app.playback.playback_session_id.as_deref(), Some("session_1"));
+        assert_eq!(
+            app.playback.playback_session_id.as_deref(),
+            Some("session_1")
+        );
         assert_eq!(app.playback.position_ms, 500);
         assert!(!app.playback_progress_confirmed);
     }

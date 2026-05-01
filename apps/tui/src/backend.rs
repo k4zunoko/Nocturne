@@ -170,7 +170,12 @@ impl ManagedBackend {
 
 fn configured_backend_stderr() -> Stdio {
     match env::var("NOCTURNE_BACKEND_STDERR") {
-        Ok(value) if matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "inherit") => {
+        Ok(value)
+            if matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "inherit"
+            ) =>
+        {
             Stdio::inherit()
         }
         _ => Stdio::null(),
@@ -478,7 +483,7 @@ pub fn spawn_search_results_task(
 
 fn decode_backend_event(envelope: EventEnvelope<Value>) -> Result<Option<BackendEvent>, TuiError> {
     let event_id = envelope.event_id;
-        let kind = match envelope.event.as_str() {
+    let kind = match envelope.event.as_str() {
         "state.updated" => BackendEventKind::StateUpdated(
             serde_json::from_value::<StateSnapshot>(envelope.data).map_err(|error| {
                 TuiError::new(format!("failed to decode state.updated: {error}"))
@@ -673,6 +678,7 @@ mod tests {
                 backend: BackendStatus {
                     ready: true,
                     version: Some(String::from("test")),
+                    yt_dlp_version: Some(String::from("2026.05.01")),
                 },
                 playback: PlaybackState {
                     state: PlaybackStatus::Paused,
