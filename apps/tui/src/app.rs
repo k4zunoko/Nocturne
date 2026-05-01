@@ -1349,16 +1349,28 @@ fn progress_bar_spans(position_ms: u64, duration_ms: u64, width: usize) -> Vec<S
         return Vec::new();
     }
 
+    if width == 1 {
+        return vec![Span::raw("[")];
+    }
+
+    if width == 2 {
+        return vec![Span::raw("[]")];
+    }
+
     let safe_duration = duration_ms.max(1);
-    let filled = ((position_ms.min(safe_duration) as f64 / safe_duration as f64) * width as f64)
+    let inner_width = width.saturating_sub(2);
+    let filled = ((position_ms.min(safe_duration) as f64 / safe_duration as f64)
+        * inner_width as f64)
         .round() as usize;
-    let filled = filled.min(width);
+    let filled = filled.min(inner_width);
     vec![
+        Span::raw("["),
         Span::styled("━".repeat(filled), Style::default().fg(Color::White)),
         Span::styled(
-            "─".repeat(width.saturating_sub(filled)),
+            "─".repeat(inner_width.saturating_sub(filled)),
             Style::default().fg(Color::DarkGray),
         ),
+        Span::raw("]"),
     ]
 }
 
@@ -1750,11 +1762,20 @@ mod tests {
     }
 
     #[test]
-    fn progress_bar_spans_use_thin_glyphs() {
+    fn progress_bar_spans_render_bracketed_bar() {
         let spans = progress_bar_spans(50, 100, 6);
 
-        assert_eq!(spans[0].content.as_ref(), "━━━");
-        assert_eq!(spans[1].content.as_ref(), "───");
+        assert_eq!(spans[0].content.as_ref(), "[");
+        assert_eq!(spans[1].content.as_ref(), "━━");
+        assert_eq!(spans[2].content.as_ref(), "──");
+        assert_eq!(spans[3].content.as_ref(), "]");
+    }
+
+    #[test]
+    fn progress_bar_spans_handle_narrow_widths() {
+        assert_eq!(progress_bar_spans(50, 100, 0).len(), 0);
+        assert_eq!(progress_bar_spans(50, 100, 1)[0].content.as_ref(), "[");
+        assert_eq!(progress_bar_spans(50, 100, 2)[0].content.as_ref(), "[]");
     }
 
     #[test]
