@@ -1,23 +1,14 @@
 use std::collections::{BTreeMap, VecDeque};
-use std::env;
-use std::io::Read;
-use std::process::Command;
-use std::process::Stdio;
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, Instant};
 
 use nocturne_core::{PortError, SearchPort};
 use nocturne_domain::Song;
 use serde_json::Value;
 
 use crate::recover_lock;
+use crate::yt_dlp::LocalYtDlpManager;
 
-const DEFAULT_YT_DLP_BINARY: &str = "yt-dlp";
-const DEFAULT_WINDOWS_YT_DLP_PATH: &str = r"C:\tools\yt-dlp\yt-dlp.exe";
-const YT_DLP_PATH_ENV: &str = "NOCTURNE_YT_DLP_PATH";
 const SEARCH_RESULT_LIMIT: usize = 5;
-const YT_DLP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingSearchJob {
@@ -36,6 +27,7 @@ struct LocalSearchState {
     pending: VecDeque<PendingSearchJob>,
     fixtures: BTreeMap<String, Vec<Song>>,
     failures: BTreeMap<String, LocalSearchFailure>,
+    yt_dlp: LocalYtDlpManager,
 }
 
 #[derive(Debug, Clone)]
@@ -50,12 +42,25 @@ impl Default for LocalSearchRuntime {
                 pending: VecDeque::new(),
                 fixtures: BTreeMap::new(),
                 failures: BTreeMap::new(),
+                yt_dlp: LocalYtDlpManager::default(),
             })),
         }
     }
 }
 
 impl LocalSearchRuntime {
+    #[must_use]
+    pub fn with_yt_dlp(yt_dlp: LocalYtDlpManager) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LocalSearchState {
+                pending: VecDeque::new(),
+                fixtures: BTreeMap::new(),
+                failures: BTreeMap::new(),
+                yt_dlp,
+            })),
+        }
+    }
+
     #[must_use]
     pub fn drain_pending(&self) -> Vec<PendingSearchJob> {
         let mut state = recover_lock(&self.inner);
@@ -86,8 +91,7 @@ impl LocalSearchRuntime {
     pub fn resolve(&self, query: &str) -> Result<Vec<Song>, LocalSearchFailure> {
         let query = query.trim();
         let normalized_query = normalize_query(query);
-
-        {
+        let yt_dlp = {
             let state = recover_lock(&self.inner);
 
             if let Some(failure) = state.failures.get(&normalized_query) {
@@ -97,9 +101,11 @@ impl LocalSearchRuntime {
             if let Some(results) = state.fixtures.get(&normalized_query) {
                 return Ok(results.clone());
             }
-        }
 
-        search_with_yt_dlp(query)
+            state.yt_dlp.clone()
+        };
+
+        search_with_yt_dlp(query, &yt_dlp)
     }
 
     fn enqueue(&self, job_id: &str, query: &str) {
@@ -131,16 +137,21 @@ impl SearchPort for LocalSearchAdapter {
     }
 }
 
-fn search_with_yt_dlp(query: &str) -> Result<Vec<Song>, LocalSearchFailure> {
+fn search_with_yt_dlp(
+    query: &str,
+    yt_dlp: &LocalYtDlpManager,
+) -> Result<Vec<Song>, LocalSearchFailure> {
     let search_term = format!("ytsearch{SEARCH_RESULT_LIMIT}:{query}");
-    let output = execute_yt_dlp([
-        "--dump-single-json",
-        "--flat-playlist",
-        "--no-warnings",
-        "--quiet",
-        "--skip-download",
-        &search_term,
-    ])?;
+    let output = yt_dlp
+        .execute([
+            "--dump-single-json",
+            "--flat-playlist",
+            "--no-warnings",
+            "--quiet",
+            "--skip-download",
+            &search_term,
+        ])
+        .map_err(map_spawn_error)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -156,19 +167,6 @@ fn search_with_yt_dlp(query: &str) -> Result<Vec<Song>, LocalSearchFailure> {
     parse_yt_dlp_search_output(&output.stdout)
 }
 
-fn yt_dlp_executable() -> std::ffi::OsString {
-    if let Some(path) = env::var_os(YT_DLP_PATH_ENV) {
-        return path;
-    }
-
-    let windows_fallback = std::path::PathBuf::from(DEFAULT_WINDOWS_YT_DLP_PATH);
-    if windows_fallback.is_file() {
-        return windows_fallback.into_os_string();
-    }
-
-    DEFAULT_YT_DLP_BINARY.into()
-}
-
 fn map_spawn_error(error: std::io::Error) -> LocalSearchFailure {
     let code = if error.kind() == std::io::ErrorKind::NotFound {
         "yt_dlp_missing"
@@ -180,82 +178,6 @@ fn map_spawn_error(error: std::io::Error) -> LocalSearchFailure {
         code: String::from(code),
         message: String::from("Search provider is unavailable on this backend."),
     }
-}
-
-fn execute_yt_dlp<'a>(
-    args: impl IntoIterator<Item = &'a str>,
-) -> Result<std::process::Output, LocalSearchFailure> {
-    let mut child = Command::new(yt_dlp_executable())
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(map_spawn_error)?;
-
-    let stdout = child.stdout.take().ok_or_else(|| LocalSearchFailure {
-        code: String::from("yt_dlp_spawn_failed"),
-        message: String::from("Search provider could not be started."),
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| LocalSearchFailure {
-        code: String::from("yt_dlp_spawn_failed"),
-        message: String::from("Search provider could not be started."),
-    })?;
-
-    let stdout_thread = thread::spawn(move || read_stream(stdout));
-    let stderr_thread = thread::spawn(move || read_stream(stderr));
-    let started_at = Instant::now();
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started_at.elapsed() >= YT_DLP_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(LocalSearchFailure {
-                    code: String::from("yt_dlp_timeout"),
-                    message: String::from("Search provider timed out."),
-                });
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(error) => {
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(LocalSearchFailure {
-                    code: String::from("yt_dlp_spawn_failed"),
-                    message: format!("Search provider status check failed: {error}"),
-                });
-            }
-        }
-    };
-
-    let stdout = stdout_thread
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked")))
-        .map_err(|error| LocalSearchFailure {
-            code: String::from("yt_dlp_spawn_failed"),
-            message: format!("Search provider stdout read failed: {error}"),
-        })?;
-    let stderr = stderr_thread
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")))
-        .map_err(|error| LocalSearchFailure {
-            code: String::from("yt_dlp_spawn_failed"),
-            message: format!("Search provider stderr read failed: {error}"),
-        })?;
-
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn read_stream(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-    stream.read_to_end(&mut buffer)?;
-    Ok(buffer)
 }
 
 fn parse_yt_dlp_search_output(payload: &[u8]) -> Result<Vec<Song>, LocalSearchFailure> {

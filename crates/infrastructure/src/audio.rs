@@ -1,8 +1,5 @@
 use std::collections::HashMap;
-use std::env;
 use std::io::BufReader;
-use std::io::Read;
-use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -18,13 +15,10 @@ use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::recover_lock;
+use crate::yt_dlp::LocalYtDlpManager;
 
-const DEFAULT_YT_DLP_BINARY: &str = "yt-dlp";
-const DEFAULT_WINDOWS_YT_DLP_PATH: &str = r"C:\tools\yt-dlp\yt-dlp.exe";
-const YT_DLP_PATH_ENV: &str = "NOCTURNE_YT_DLP_PATH";
 const YT_DLP_AUDIO_FORMAT: &str = "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
 const YT_DLP_PROCESS_AUDIO_FORMAT: &str = "140/139";
-const YT_DLP_TIMEOUT: Duration = Duration::from_secs(15);
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const PLAYBACK_URL_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const PLAYBACK_URL_CACHE_LIMIT: usize = 64;
@@ -117,9 +111,19 @@ pub struct LocalPlaybackAdapter {
 impl LocalPlaybackAdapter {
     #[must_use]
     pub fn new(state: SharedPlaybackState, event_tx: UnboundedSender<PlaybackWorkerEvent>) -> Self {
+        Self::with_yt_dlp(state, event_tx, LocalYtDlpManager::default())
+    }
+
+    #[must_use]
+    pub fn with_yt_dlp(
+        state: SharedPlaybackState,
+        event_tx: UnboundedSender<PlaybackWorkerEvent>,
+        yt_dlp: LocalYtDlpManager,
+    ) -> Self {
         let (commands, receiver) = mpsc::sync_channel(8);
         let worker_state = state.clone();
-        let worker = thread::spawn(move || playback_worker_loop(receiver, worker_state, event_tx));
+        let worker =
+            thread::spawn(move || playback_worker_loop(receiver, worker_state, event_tx, yt_dlp));
 
         Self {
             commands,
@@ -251,6 +255,7 @@ fn playback_worker_loop(
     receiver: mpsc::Receiver<WorkerCommand>,
     state: SharedPlaybackState,
     event_tx: UnboundedSender<PlaybackWorkerEvent>,
+    yt_dlp: LocalYtDlpManager,
 ) {
     let mut active = None;
     let mut playback_runtime = None;
@@ -269,6 +274,7 @@ fn playback_worker_loop(
                     &mut active,
                     &mut playback_runtime,
                     &mut resolved_playback_urls,
+                    &yt_dlp,
                     &event_tx,
                     item,
                     playback_session_id,
@@ -309,6 +315,7 @@ fn handle_start(
     active: &mut Option<ActivePlayback>,
     playback_runtime: &mut Option<Runtime>,
     resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
+    yt_dlp: &LocalYtDlpManager,
     event_tx: &UnboundedSender<PlaybackWorkerEvent>,
     item: QueueItem,
     playback_session_id: String,
@@ -333,6 +340,7 @@ fn handle_start(
             position_ms,
             playback_runtime,
             resolved_playback_urls,
+            yt_dlp,
             volume_percent,
         ) {
             Ok(active_playback) => active_playback,
@@ -402,7 +410,8 @@ fn handle_pause(
             ..
         }) => {
             if !*paused {
-                *base_position_ms = simulated_position_ms(*anchor_at, *base_position_ms, *duration_ms);
+                *base_position_ms =
+                    simulated_position_ms(*anchor_at, *base_position_ms, *duration_ms);
                 *paused = true;
             }
         }
@@ -441,9 +450,7 @@ fn handle_resume(
 ) -> Result<(), PortError> {
     match active.as_mut() {
         Some(ActivePlayback::Simulated {
-            anchor_at,
-            paused,
-            ..
+            anchor_at, paused, ..
         }) => {
             if *paused {
                 *anchor_at = Instant::now();
@@ -513,7 +520,8 @@ fn poll_active_playback(
         return;
     };
 
-    let (playback_session_id, queue_item_id, position_ms, paused, finished) = match active_playback {
+    let (playback_session_id, queue_item_id, position_ms, paused, finished) = match active_playback
+    {
         ActivePlayback::Simulated {
             playback_session_id,
             anchor_at,
@@ -620,6 +628,7 @@ fn open_real_playback(
     position_ms: u64,
     playback_runtime: &mut Option<Runtime>,
     resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
+    yt_dlp: &LocalYtDlpManager,
     volume_percent: u8,
 ) -> Result<ActivePlayback, PortError> {
     let audio_output_started_at = Instant::now();
@@ -642,7 +651,7 @@ fn open_real_playback(
     let (playback_url, reader, resolve_elapsed_ms, stream_open_elapsed_ms) =
         if is_youtube_url(&item.song.source_url) {
             let stream_open_started_at = Instant::now();
-            match runtime.block_on(open_youtube_playback_stream(&item.song.source_url)) {
+            match runtime.block_on(open_youtube_playback_stream(&item.song.source_url, yt_dlp)) {
                 Ok(reader) => (
                     String::from("https://youtube.local/audio.m4a?mime=audio%2Fmp4"),
                     reader,
@@ -651,8 +660,11 @@ fn open_real_playback(
                 ),
                 Err(_) => {
                     let resolve_started_at = Instant::now();
-                    let playback_url =
-                        resolve_playback_url(&item.song.source_url, resolved_playback_urls)?;
+                    let playback_url = resolve_playback_url(
+                        &item.song.source_url,
+                        resolved_playback_urls,
+                        yt_dlp,
+                    )?;
                     let resolve_elapsed_ms = resolve_started_at.elapsed().as_millis();
                     let stream_open_started_at = Instant::now();
                     let reader = runtime.block_on(open_http_playback_stream(&playback_url))?;
@@ -665,7 +677,8 @@ fn open_real_playback(
                 }
             }
         } else {
-            let playback_url = resolve_playback_url(&item.song.source_url, resolved_playback_urls)?;
+            let playback_url =
+                resolve_playback_url(&item.song.source_url, resolved_playback_urls, yt_dlp)?;
             let stream_open_started_at = Instant::now();
             let reader = runtime.block_on(open_http_playback_stream(&playback_url))?;
             (
@@ -788,8 +801,9 @@ async fn open_http_playback_stream(
 
 async fn open_youtube_playback_stream(
     source_url: &str,
+    yt_dlp: &LocalYtDlpManager,
 ) -> Result<StreamDownload<TempStorageProvider>, PortError> {
-    let process_params = build_youtube_process_stream_params(source_url)?;
+    let process_params = build_youtube_process_stream_params(source_url, yt_dlp)?;
 
     StreamDownload::new_process(
         process_params,
@@ -807,9 +821,10 @@ async fn open_youtube_playback_stream(
 
 fn build_youtube_process_stream_params(
     source_url: &str,
+    yt_dlp: &LocalYtDlpManager,
 ) -> Result<ProcessStreamParams, PortError> {
     let command = YtDlpCommand::new(source_url)
-        .yt_dlp_path(yt_dlp_executable())
+        .yt_dlp_path(yt_dlp.executable_path())
         .extract_audio(true)
         .format(YT_DLP_PROCESS_AUDIO_FORMAT);
     let params = ProcessStreamParams::new(command).map_err(|error| {
@@ -825,13 +840,14 @@ fn build_youtube_process_stream_params(
 fn resolve_playback_url(
     source_url: &str,
     resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
+    yt_dlp: &LocalYtDlpManager,
 ) -> Result<String, PortError> {
     if is_youtube_url(source_url) {
         if let Some(playback_url) = cached_playback_url(source_url, resolved_playback_urls) {
             return Ok(playback_url);
         }
 
-        let playback_url = resolve_youtube_playback_url(source_url)?;
+        let playback_url = resolve_youtube_playback_url(source_url, yt_dlp)?;
         insert_cached_playback_url(source_url, playback_url.clone(), resolved_playback_urls);
         Ok(playback_url)
     } else {
@@ -875,19 +891,25 @@ fn insert_cached_playback_url(
 }
 
 fn prune_cached_playback_urls(resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>) {
-    resolved_playback_urls.retain(|_, cached| cached.resolved_at.elapsed() <= PLAYBACK_URL_CACHE_TTL);
+    resolved_playback_urls
+        .retain(|_, cached| cached.resolved_at.elapsed() <= PLAYBACK_URL_CACHE_TTL);
 }
 
-fn resolve_youtube_playback_url(source_url: &str) -> Result<String, PortError> {
-    let output = execute_yt_dlp([
-        "--get-url",
-        "--format",
-        YT_DLP_AUDIO_FORMAT,
-        "--no-playlist",
-        "--no-warnings",
-        "--quiet",
-        source_url,
-    ])?;
+fn resolve_youtube_playback_url(
+    source_url: &str,
+    yt_dlp: &LocalYtDlpManager,
+) -> Result<String, PortError> {
+    let output = yt_dlp
+        .execute([
+            "--get-url",
+            "--format",
+            YT_DLP_AUDIO_FORMAT,
+            "--no-playlist",
+            "--no-warnings",
+            "--quiet",
+            source_url,
+        ])
+        .map_err(map_yt_dlp_spawn_error)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -909,97 +931,6 @@ fn resolve_youtube_playback_url(source_url: &str) -> Result<String, PortError> {
     })
 }
 
-fn execute_yt_dlp<'a>(
-    args: impl IntoIterator<Item = &'a str>,
-) -> Result<std::process::Output, PortError> {
-    let mut child = Command::new(yt_dlp_executable())
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(map_yt_dlp_spawn_error)?;
-
-    let stdout = child.stdout.take().ok_or_else(|| {
-        PortError::new(
-            "yt_dlp_spawn_failed",
-            "yt-dlp could not start its stdout pipe",
-        )
-    })?;
-    let stderr = child.stderr.take().ok_or_else(|| {
-        PortError::new(
-            "yt_dlp_spawn_failed",
-            "yt-dlp could not start its stderr pipe",
-        )
-    })?;
-
-    let stdout_thread = thread::spawn(move || read_stream(stdout));
-    let stderr_thread = thread::spawn(move || read_stream(stderr));
-    let started_at = Instant::now();
-
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started_at.elapsed() >= YT_DLP_TIMEOUT => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(PortError::new(
-                    "yt_dlp_timeout",
-                    "yt-dlp timed out while preparing playback",
-                ));
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(50)),
-            Err(error) => {
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                return Err(PortError::new(
-                    "yt_dlp_spawn_failed",
-                    format!("yt-dlp status check failed: {error}"),
-                ));
-            }
-        }
-    };
-
-    let stdout = stdout_thread
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stdout reader panicked")))
-        .map_err(|error| {
-            PortError::new(
-                "yt_dlp_spawn_failed",
-                format!("failed to read yt-dlp stdout: {error}"),
-            )
-        })?;
-    let stderr = stderr_thread
-        .join()
-        .unwrap_or_else(|_| Err(std::io::Error::other("stderr reader panicked")))
-        .map_err(|error| {
-            PortError::new(
-                "yt_dlp_spawn_failed",
-                format!("failed to read yt-dlp stderr: {error}"),
-            )
-        })?;
-
-    Ok(std::process::Output {
-        status,
-        stdout,
-        stderr,
-    })
-}
-
-fn yt_dlp_executable() -> std::ffi::OsString {
-    if let Some(path) = env::var_os(YT_DLP_PATH_ENV) {
-        return path;
-    }
-
-    let windows_fallback = std::path::PathBuf::from(DEFAULT_WINDOWS_YT_DLP_PATH);
-    if windows_fallback.is_file() {
-        return windows_fallback.into_os_string();
-    }
-
-    DEFAULT_YT_DLP_BINARY.into()
-}
-
 fn percent_to_gain(volume_percent: u8) -> f32 {
     f32::from(volume_percent.min(100)) / 100.0
 }
@@ -1016,12 +947,6 @@ fn map_yt_dlp_spawn_error(error: std::io::Error) -> PortError {
     };
 
     PortError::new(code, format!("yt-dlp is unavailable for playback: {error}"))
-}
-
-fn read_stream(mut stream: impl Read) -> std::io::Result<Vec<u8>> {
-    let mut buffer = Vec::new();
-    stream.read_to_end(&mut buffer)?;
-    Ok(buffer)
 }
 
 fn first_non_empty_line(stdout: &[u8]) -> Option<String> {
@@ -1178,7 +1103,10 @@ mod tests {
         assert_eq!(snapshot.position_ms, 42_000);
         assert!(!snapshot.paused);
         assert_eq!(snapshot.history.len(), 4);
-        assert_eq!(snapshot.playback_session_id.as_deref(), Some("playback_session_1"));
+        assert_eq!(
+            snapshot.playback_session_id.as_deref(),
+            Some("playback_session_1")
+        );
     }
 
     #[test]
@@ -1220,7 +1148,10 @@ mod tests {
         let still_paused_snapshot = shared.snapshot();
         assert!(still_paused_snapshot.paused);
         assert!(
-            still_paused_snapshot.position_ms.abs_diff(paused_snapshot.position_ms) <= 50,
+            still_paused_snapshot
+                .position_ms
+                .abs_diff(paused_snapshot.position_ms)
+                <= 50,
             "paused playback advanced too far: {} -> {}",
             paused_snapshot.position_ms,
             still_paused_snapshot.position_ms
@@ -1251,9 +1182,7 @@ mod tests {
         let mut short_item = queue_item("queue_item_short");
         short_item.song.duration_ms = 50;
 
-        adapter
-            .start(&short_item, "playback_session_1", 0)
-            .unwrap();
+        adapter.start(&short_item, "playback_session_1", 0).unwrap();
         thread::sleep(Duration::from_millis(400));
 
         let snapshot = shared.snapshot();
@@ -1291,7 +1220,8 @@ mod tests {
 
     #[test]
     fn infer_decoder_preferences_recognizes_mp3_streams() {
-        let preferences = infer_decoder_preferences("https://example.com/audio.mp3?mime=audio%2Fmpeg");
+        let preferences =
+            infer_decoder_preferences("https://example.com/audio.mp3?mime=audio%2Fmpeg");
 
         assert_eq!(preferences.format_hint, Some("mp3"));
         assert_eq!(preferences.mime_type, Some("audio/mpeg"));
