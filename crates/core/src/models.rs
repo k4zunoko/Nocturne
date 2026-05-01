@@ -9,6 +9,7 @@ pub type CoreTimestamp = String;
 pub struct BackendState {
     pub ready: bool,
     pub version: Option<String>,
+    pub yt_dlp_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

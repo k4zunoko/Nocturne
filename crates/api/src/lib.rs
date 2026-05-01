@@ -61,6 +61,7 @@ pub struct SearchJobSummary {
 pub struct BackendStatus {
     pub ready: bool,
     pub version: Option<String>,
+    pub yt_dlp_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -68,6 +69,7 @@ pub struct HealthResponse {
     pub ok: bool,
     pub ready: bool,
     pub version: Option<String>,
+    pub yt_dlp_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

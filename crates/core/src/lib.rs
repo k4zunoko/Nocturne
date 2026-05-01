@@ -12,8 +12,8 @@ use nocturne_domain::{PlaybackState, PlaybackStatus};
 pub use models::{
     BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreId,
     CoreSnapshot, CoreTimestamp, PlaybackProgressEvent, SearchJobCompletedEvent,
-    SearchJobFailedEvent, SearchJobRecord, SearchJobStatus, SearchResultsRecord,
-    StateUpdatedEvent, SystemErrorEvent, SystemErrorSeverity,
+    SearchJobFailedEvent, SearchJobRecord, SearchJobStatus, SearchResultsRecord, StateUpdatedEvent,
+    SystemErrorEvent, SystemErrorSeverity,
 };
 pub use orchestrator::{CoreError, Orchestrator};
 pub use ports::{

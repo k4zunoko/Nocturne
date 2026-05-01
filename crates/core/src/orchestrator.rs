@@ -9,8 +9,7 @@ use nocturne_domain::{
 use crate::models::{
     BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreSnapshot,
     PlaybackProgressEvent, SearchJobCompletedEvent, SearchJobFailedEvent, SearchJobRecord,
-    SearchJobStatus, SearchResultsRecord, StateUpdatedEvent, SystemErrorEvent,
-    SystemErrorSeverity,
+    SearchJobStatus, SearchResultsRecord, StateUpdatedEvent, SystemErrorEvent, SystemErrorSeverity,
 };
 use crate::ports::{
     ClockPort, EventPublisherPort, IdGeneratorPort, IdKind, PlaybackPort, PortError, SearchPort,
@@ -89,6 +88,7 @@ impl Default for OrchestratorState {
             backend: BackendState {
                 ready: true,
                 version: None,
+                yt_dlp_version: None,
             },
             playback: PlaybackState {
                 state: PlaybackStatus::Stopped,
@@ -150,6 +150,24 @@ where
 
     pub fn set_backend_version(&mut self, version: Option<impl Into<String>>) {
         self.state.backend.version = version.map(Into::into);
+    }
+
+    pub fn set_yt_dlp_version(&mut self, version: Option<impl Into<String>>) {
+        self.state.backend.yt_dlp_version = version.map(Into::into);
+    }
+
+    pub fn update_yt_dlp_version(
+        &mut self,
+        version: Option<impl Into<String>>,
+    ) -> Result<bool, CoreError> {
+        let version = version.map(Into::into);
+        if self.state.backend.yt_dlp_version == version {
+            return Ok(false);
+        }
+
+        self.state.backend.yt_dlp_version = version;
+        self.publish_state_updated()?;
+        Ok(true)
     }
 
     pub fn snapshot(&mut self) -> CoreSnapshot {
@@ -536,12 +554,17 @@ where
         }
 
         self.playback.seek(position_ms)?;
-        let playback_session_id = self
-            .state
-            .playback
-            .playback_session_id
-            .clone()
-            .ok_or_else(|| CoreError::conflict("no_playback_session", "cannot seek without an active playback session"))?;
+        let playback_session_id =
+            self.state
+                .playback
+                .playback_session_id
+                .clone()
+                .ok_or_else(|| {
+                    CoreError::conflict(
+                        "no_playback_session",
+                        "cannot seek without an active playback session",
+                    )
+                })?;
         self.report_playback_progress(&playback_session_id, position_ms)?;
         self.command_accepted(None, None)
     }
@@ -570,7 +593,11 @@ where
         Ok(true)
     }
 
-    pub fn finish_current_track(&mut self, playback_session_id: &str, position_ms: u64) -> Result<bool, CoreError> {
+    pub fn finish_current_track(
+        &mut self,
+        playback_session_id: &str,
+        position_ms: u64,
+    ) -> Result<bool, CoreError> {
         if self.state.playback.playback_session_id.as_deref() != Some(playback_session_id) {
             return Ok(false);
         }
@@ -681,7 +708,10 @@ where
 
         self.publish_state_updated()?;
 
-        if let Err(error) = self.playback.start(&item, &playback_session_id, position_ms) {
+        if let Err(error) = self
+            .playback
+            .start(&item, &playback_session_id, position_ms)
+        {
             self.state.playback.state = PlaybackStatus::Stopped;
             self.state.playback.position_ms = 0;
             self.state.playback.current_queue_item_id = None;
@@ -895,8 +925,10 @@ mod tests {
             playback_session_id: &str,
             position_ms: u64,
         ) -> Result<(), PortError> {
-            self.started
-                .push(format!("{}:{}@{}", playback_session_id, item.id, position_ms));
+            self.started.push(format!(
+                "{}:{}@{}",
+                playback_session_id, item.id, position_ms
+            ));
             Ok(())
         }
 
@@ -917,10 +949,7 @@ mod tests {
 
         fn stop(&mut self) -> Result<(), PortError> {
             if self.fail_stop {
-                return Err(PortError::new(
-                    "playback_stop_failed",
-                    "stub stop failure",
-                ));
+                return Err(PortError::new("playback_stop_failed", "stub stop failure"));
             }
             self.stopped += 1;
             Ok(())
@@ -1489,10 +1518,53 @@ mod tests {
         }
 
         assert_eq!(orchestrator.queue().len(), 1);
-        assert_eq!(orchestrator.state().playback().state, PlaybackStatus::Loading);
         assert_eq!(
-            orchestrator.state().playback().current_queue_item_id.as_deref(),
+            orchestrator.state().playback().state,
+            PlaybackStatus::Loading
+        );
+        assert_eq!(
+            orchestrator
+                .state()
+                .playback()
+                .current_queue_item_id
+                .as_deref(),
             Some("queue_item_0001")
         );
+    }
+
+    #[test]
+    fn updating_yt_dlp_version_publishes_state_once() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        let updated = orchestrator
+            .update_yt_dlp_version(Some("2026.05.01"))
+            .unwrap();
+
+        assert!(updated);
+        assert_eq!(
+            orchestrator.state().backend().yt_dlp_version.as_deref(),
+            Some("2026.05.01")
+        );
+        match &orchestrator.events.published.last().unwrap().data {
+            CoreEvent::StateUpdated(event) => {
+                assert_eq!(
+                    event.snapshot.backend.yt_dlp_version.as_deref(),
+                    Some("2026.05.01")
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let updated = orchestrator
+            .update_yt_dlp_version(Some("2026.05.01"))
+            .unwrap();
+
+        assert!(!updated);
     }
 }
