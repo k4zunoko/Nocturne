@@ -16,10 +16,11 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use nocturne_api::{
     ApiVersion, BackendStatus, CommandAccepted, EmptyPayload, EventEnvelope, EventName,
-    HealthResponse, PlaybackProgress, PlaybackSeekRequest, PlaybackVolumeRequest, ProblemDetails,
-    QueueAddRequest, QueueMoveRequest, QueueRemoveRequest, QueueResponse, SearchCommandRequest,
-    SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus, SearchJobSummary,
-    SearchResultsResponse, StateSnapshot, SystemError, SystemErrorSeverity,
+    HealthResponse, PlaybackProgress, PlaybackRepeatRequest, PlaybackSeekRequest,
+    PlaybackVolumeRequest, ProblemDetails, QueueAddRequest, QueueMoveRequest, QueueRemoveRequest,
+    QueueResponse, SearchCommandRequest, SearchJobCompleted, SearchJobFailed,
+    SearchJobStatus as ApiSearchJobStatus, SearchJobSummary, SearchResultsResponse, StateSnapshot,
+    SystemError, SystemErrorSeverity,
 };
 use nocturne_core::{
     CoreError, CoreEvent, CoreEventEnvelope, CoreSnapshot, NocturneCore, Orchestrator,
@@ -409,8 +410,12 @@ fn app_router(state: AppState) -> Router {
             post(playback_next_handler),
         )
         .route(
-            "/api/v1/commands/playback/previous",
-            post(playback_previous_handler),
+            "/api/v1/commands/playback/restart_current",
+            post(playback_restart_current_handler),
+        )
+        .route(
+            "/api/v1/commands/playback/repeat",
+            post(playback_repeat_handler),
         )
         .route(
             "/api/v1/commands/playback/seek",
@@ -667,17 +672,31 @@ async fn playback_next_handler(
     Ok(command_accepted_response(receipt))
 }
 
-async fn playback_previous_handler(
+async fn playback_restart_current_handler(
     State(state): State<AppState>,
     request: Result<ExtractJson<EmptyPayload>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
-    let ExtractJson(_) =
-        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/previous"))?;
+    let ExtractJson(_) = request
+        .map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/restart_current"))?;
     let mut orchestrator = state.orchestrator.lock().await;
-    let receipt = orchestrator.previous().map_err(|error| {
+    let receipt = orchestrator.restart_current().map_err(|error| {
         report_playback_command_error(&mut orchestrator, &error);
-        map_core_error(error, "/api/v1/commands/playback/previous")
+        map_core_error(error, "/api/v1/commands/playback/restart_current")
     })?;
+
+    Ok(command_accepted_response(receipt))
+}
+
+async fn playback_repeat_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<PlaybackRepeatRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(request) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/playback/repeat"))?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .set_repeat_mode(request.repeat_mode)
+        .map_err(|error| map_core_error(error, "/api/v1/commands/playback/repeat"))?;
 
     Ok(command_accepted_response(receipt))
 }
