@@ -7,7 +7,7 @@ pub mod models;
 pub mod orchestrator;
 pub mod ports;
 
-use nocturne_domain::{PlaybackState, PlaybackStatus};
+use nocturne_domain::{PlaybackState, PlaybackStatus, RepeatMode};
 
 pub use models::{
     BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreId,
@@ -41,6 +41,7 @@ impl NocturneCore {
             position_ms: 0,
             current_queue_item_id: None,
             playback_session_id: None,
+            repeat_mode: RepeatMode::Off,
         }
     }
 }

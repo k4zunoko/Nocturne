@@ -72,10 +72,19 @@ pub enum PlaybackStatus {
     Paused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RepeatMode {
+    #[default]
+    Off,
+    All,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlaybackState {
     pub state: PlaybackStatus,
     pub position_ms: u64,
     pub current_queue_item_id: Option<String>,
     pub playback_session_id: Option<String>,
+    pub repeat_mode: RepeatMode,
 }

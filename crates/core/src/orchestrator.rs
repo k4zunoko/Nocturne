@@ -3,7 +3,7 @@ use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
 use nocturne_domain::{
-    AudioSettings, PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, Song,
+    AudioSettings, PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, RepeatMode, Song,
 };
 
 use crate::models::{
@@ -95,6 +95,7 @@ impl Default for OrchestratorState {
                 position_ms: 0,
                 current_queue_item_id: None,
                 playback_session_id: None,
+                repeat_mode: RepeatMode::Off,
             },
             audio: AudioSettings::default(),
             queue: Vec::new(),
@@ -494,10 +495,24 @@ where
         self.command_accepted(None, None)
     }
 
+    pub fn set_repeat_mode(
+        &mut self,
+        repeat_mode: RepeatMode,
+    ) -> Result<CommandReceipt, CoreError> {
+        if self.state.playback.repeat_mode == repeat_mode {
+            return self.command_accepted(None, None);
+        }
+
+        self.state.playback.repeat_mode = repeat_mode;
+        self.publish_state_updated()?;
+
+        self.command_accepted(None, None)
+    }
+
     pub fn next(&mut self) -> Result<CommandReceipt, CoreError> {
         match self.current_index() {
             Some(current_index) => {
-                self.state.queue.remove(current_index);
+                let next_index = self.advance_queue_from_current(current_index)?;
 
                 if self.state.queue.is_empty() {
                     self.playback.stop()?;
@@ -507,7 +522,7 @@ where
                     self.state.playback.playback_session_id = None;
                     self.publish_state_updated()?;
                 } else {
-                    self.start_track(current_index.min(self.state.queue.len() - 1), 0)?;
+                    self.start_track(next_index, 0)?;
                 }
             }
             None if !self.state.queue.is_empty() => {
@@ -524,7 +539,7 @@ where
         self.command_accepted(None, None)
     }
 
-    pub fn previous(&mut self) -> Result<CommandReceipt, CoreError> {
+    pub fn restart_current(&mut self) -> Result<CommandReceipt, CoreError> {
         if self.state.queue.is_empty() {
             return Err(CoreError::conflict(
                 "queue_empty",
@@ -607,7 +622,7 @@ where
             return Ok(false);
         };
 
-        self.state.queue.remove(current_index);
+        let next_index = self.advance_queue_from_current(current_index)?;
 
         if self.state.queue.is_empty() {
             self.playback.stop()?;
@@ -617,7 +632,7 @@ where
             self.state.playback.playback_session_id = None;
             self.publish_state_updated()?;
         } else {
-            self.start_track(current_index.min(self.state.queue.len() - 1), 0)?;
+            self.start_track(next_index, 0)?;
         }
 
         Ok(true)
@@ -776,6 +791,17 @@ where
             .queue
             .iter()
             .position(|item| item.id == current_id)
+    }
+
+    fn advance_queue_from_current(&mut self, current_index: usize) -> Result<usize, CoreError> {
+        if self.state.playback.repeat_mode == RepeatMode::All {
+            let item = self.state.queue.remove(current_index);
+            self.state.queue.push(item);
+            return Ok(current_index.min(self.state.queue.len().saturating_sub(1)));
+        }
+
+        self.state.queue.remove(current_index);
+        Ok(current_index.min(self.state.queue.len().saturating_sub(1)))
     }
 
     fn find_search_job_mut(&mut self, job_id: &str) -> Result<&mut SearchJobRecord, CoreError> {
@@ -1216,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn previous_restarts_current_track_without_history() {
+    fn restart_current_restarts_current_track_without_history() {
         let mut orchestrator = Orchestrator::new(
             StubClock,
             StubIds::default(),
@@ -1232,7 +1258,7 @@ mod tests {
             .unwrap();
         orchestrator.seek(12_345).unwrap();
 
-        orchestrator.previous().unwrap();
+        orchestrator.restart_current().unwrap();
         let second_session_id = current_session_id(&orchestrator);
         orchestrator
             .confirm_playback_started(&second_session_id, "queue_item_0001", 0)
@@ -1242,6 +1268,127 @@ mod tests {
         assert_eq!(orchestrator.queue()[0].song.id, "song_1");
         assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
         assert_eq!(orchestrator.state().playback().position_ms, 0);
+    }
+
+    #[test]
+    fn finish_current_track_with_repeat_all_rotates_item_to_tail() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.set_repeat_mode(RepeatMode::All).unwrap();
+        let first_queue_item_id = orchestrator
+            .enqueue_song(song("song_1"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        let second_queue_item_id = orchestrator
+            .enqueue_song(song("song_2"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        let first_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&first_session_id, &first_queue_item_id, 0)
+            .unwrap();
+
+        orchestrator
+            .finish_current_track(&first_session_id, 180_000)
+            .unwrap();
+        let second_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&second_session_id, &second_queue_item_id, 0)
+            .unwrap();
+
+        assert_eq!(orchestrator.queue().len(), 2);
+        assert_eq!(orchestrator.queue()[0].song.id, "song_2");
+        assert_eq!(orchestrator.queue()[1].song.id, "song_1");
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+    }
+
+    #[test]
+    fn next_with_repeat_all_rotates_item_to_tail() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.set_repeat_mode(RepeatMode::All).unwrap();
+        let first_queue_item_id = orchestrator
+            .enqueue_song(song("song_1"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        let second_queue_item_id = orchestrator
+            .enqueue_song(song("song_2"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        let first_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&first_session_id, &first_queue_item_id, 0)
+            .unwrap();
+
+        orchestrator.next().unwrap();
+        let second_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&second_session_id, &second_queue_item_id, 0)
+            .unwrap();
+
+        assert_eq!(orchestrator.queue().len(), 2);
+        assert_eq!(orchestrator.queue()[0].song.id, "song_2");
+        assert_eq!(orchestrator.queue()[1].song.id, "song_1");
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+    }
+
+    #[test]
+    fn next_with_repeat_all_wraps_from_last_item_to_front() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.set_repeat_mode(RepeatMode::All).unwrap();
+        let first_queue_item_id = orchestrator
+            .enqueue_song(song("song_1"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        let second_queue_item_id = orchestrator
+            .enqueue_song(song("song_2"))
+            .unwrap()
+            .queue_item_id
+            .unwrap();
+        let first_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&first_session_id, &first_queue_item_id, 0)
+            .unwrap();
+        orchestrator.next().unwrap();
+        let second_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&second_session_id, &second_queue_item_id, 0)
+            .unwrap();
+
+        orchestrator.next().unwrap();
+        let third_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&third_session_id, &first_queue_item_id, 0)
+            .unwrap();
+
+        assert_eq!(orchestrator.queue().len(), 2);
+        assert_eq!(orchestrator.queue()[0].song.id, "song_1");
+        assert_eq!(orchestrator.queue()[1].song.id, "song_2");
+        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
     }
 
     #[test]

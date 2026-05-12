@@ -1,6 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 
-use nocturne_domain::{AudioSettings, PlaybackState, QueueItem, Song};
+use nocturne_domain::{AudioSettings, PlaybackState, QueueItem, RepeatMode, Song};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -161,6 +161,12 @@ pub struct PlaybackSeekRequest {
 #[serde(deny_unknown_fields)]
 pub struct PlaybackVolumeRequest {
     pub volume_percent: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaybackRepeatRequest {
+    pub repeat_mode: RepeatMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
