@@ -10,10 +10,12 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use nocturne_api::{
     CURRENT_EVENT_ID_HEADER, CommandAccepted, EVENTS_PATH, EmptyPayload, EventEnvelope,
-    HEALTH_PATH, LAST_EVENT_ID_HEADER, PlaybackProgress, PlaybackVolumeRequest, ProblemDetails,
-    QueueAddRequest, QueueRemoveRequest, STATE_PATH, SearchCommandRequest, SearchJobCompleted,
-    SearchJobFailed, SearchJobSummary, SearchResultsResponse, StateSnapshot, SystemError,
+    HEALTH_PATH, LAST_EVENT_ID_HEADER, PlaybackProgress, PlaybackRepeatRequest,
+    PlaybackVolumeRequest, ProblemDetails, QueueAddRequest, QueueRemoveRequest, STATE_PATH,
+    SearchCommandRequest, SearchJobCompleted, SearchJobFailed, SearchJobSummary,
+    SearchResultsResponse, StateSnapshot, SystemError,
 };
+use nocturne_domain::RepeatMode;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde::Serialize;
 use serde_json::Value;
@@ -29,7 +31,8 @@ pub enum CommandAction {
     AddSong(String),
     PlayPause,
     Next,
-    Previous,
+    RestartCurrent,
+    SetRepeatMode(RepeatMode),
     SetVolume(u8),
     RemoveQueueItem(String),
 }
@@ -245,15 +248,22 @@ impl BackendClient {
                 .map(|_| {
                     CommandOutcome::StatusMessage(String::from("Skip to next track accepted."))
                 }),
-            CommandAction::Previous => self
+            CommandAction::RestartCurrent => self
                 .post_json(
-                    "/api/v1/commands/playback/previous",
+                    "/api/v1/commands/playback/restart_current",
                     &EmptyPayload::default(),
                 )
                 .await
                 .map(|_| {
                     CommandOutcome::StatusMessage(String::from("Restart current track accepted."))
                 }),
+            CommandAction::SetRepeatMode(repeat_mode) => self
+                .post_json(
+                    "/api/v1/commands/playback/repeat",
+                    &PlaybackRepeatRequest { repeat_mode },
+                )
+                .await
+                .map(|_| CommandOutcome::StatusMessage(repeat_mode_status_message(repeat_mode))),
             CommandAction::SetVolume(volume_percent) => {
                 self.post_json(
                     "/api/v1/commands/playback/volume",
@@ -527,6 +537,13 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn repeat_mode_status_message(repeat_mode: RepeatMode) -> String {
+    match repeat_mode {
+        RepeatMode::Off => String::from("Queue now stops after the last song."),
+        RepeatMode::All => String::from("Queue now loops after the last song."),
+    }
+}
+
 fn reserve_loopback_addr() -> Result<SocketAddr, TuiError> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|error| TuiError::new(format!("failed to reserve backend port: {error}")))?;
@@ -607,7 +624,7 @@ mod tests {
     use axum::http::{HeaderMap as AxumHeaderMap, StatusCode};
     use axum::{Json, Router, routing::get};
     use nocturne_api::{BackendStatus, ProblemDetails};
-    use nocturne_domain::{AudioSettings, PlaybackState, PlaybackStatus};
+    use nocturne_domain::{AudioSettings, PlaybackState, PlaybackStatus, RepeatMode};
     use tokio::net::TcpListener as TokioTcpListener;
     use tokio::sync::{Mutex, oneshot};
 
@@ -685,6 +702,7 @@ mod tests {
                     position_ms: 42_000,
                     current_queue_item_id: None,
                     playback_session_id: None,
+                    repeat_mode: RepeatMode::Off,
                 },
                 audio: AudioSettings::default(),
                 current_song: None,

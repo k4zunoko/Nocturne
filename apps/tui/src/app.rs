@@ -4,7 +4,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use nocturne_api::{BackendStatus, SearchJobStatus, SearchJobSummary, StateSnapshot};
 use nocturne_domain::{
-    AudioSettings, PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, Song,
+    AudioSettings, PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, RepeatMode, Song,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Flex, Layout, Rect};
@@ -120,6 +120,7 @@ impl App {
                 position_ms: 0,
                 current_queue_item_id: None,
                 playback_session_id: None,
+                repeat_mode: RepeatMode::Off,
             },
             audio: AudioSettings::default(),
             current_song: None,
@@ -274,9 +275,14 @@ impl App {
                     return AppAction::None;
                 }
                 KeyCode::Char('p') => return AppAction::Command(CommandAction::PlayPause),
+                KeyCode::Char('r') => {
+                    return AppAction::Command(CommandAction::SetRepeatMode(
+                        self.next_repeat_mode(),
+                    ));
+                }
                 KeyCode::Up => return self.adjust_volume(5),
                 KeyCode::Down => return self.adjust_volume(-5),
-                KeyCode::Left => return AppAction::Command(CommandAction::Previous),
+                KeyCode::Left => return AppAction::Command(CommandAction::RestartCurrent),
                 KeyCode::Right => return AppAction::Command(CommandAction::Next),
                 _ => {}
             }
@@ -924,7 +930,7 @@ impl App {
         Paragraph::new(lines)
             .block(
                 Block::default()
-                    .title("Queue Snapshot")
+                    .title(format!("Queue Snapshot · {}", self.queue_behavior_label()))
                     .borders(Borders::ALL),
             )
             .wrap(Wrap { trim: false })
@@ -968,7 +974,7 @@ impl App {
 
     fn shortcuts_widget(&self) -> Paragraph<'static> {
         Paragraph::new(Line::from(
-            "Enter search  Ctrl+P play/pause  Ctrl+Up/Down volume  Ctrl+Left previous  Ctrl+Right next  Ctrl+Q queue  F1 help  /exit quit",
+            "Enter search  Ctrl+P play/pause  Ctrl+R queue loop  Ctrl+Up/Down volume  Ctrl+Left restart current  Ctrl+Right next  Ctrl+Q queue  F1 help  /exit quit",
         ))
         .style(Style::default().fg(Color::DarkGray))
     }
@@ -1168,8 +1174,9 @@ impl App {
                 Line::from(""),
                 Line::from("Playback"),
                 Line::from("  Ctrl+P play / pause"),
+                Line::from("  Ctrl+R toggle queue loop"),
                 Line::from("  Ctrl+Up / Ctrl+Down volume +/- 5%"),
-                Line::from("  Ctrl+Left / Ctrl+Right previous / next"),
+                Line::from("  Ctrl+Left / Ctrl+Right restart current / next"),
                 Line::from(""),
                 Line::from("Overlays"),
                 Line::from("  Ctrl+Q queue"),
@@ -1231,6 +1238,20 @@ impl App {
 
         self.audio = AudioSettings::new(next);
         AppAction::Command(CommandAction::SetVolume(next))
+    }
+
+    fn next_repeat_mode(&self) -> RepeatMode {
+        match self.playback.repeat_mode {
+            RepeatMode::Off => RepeatMode::All,
+            RepeatMode::All => RepeatMode::Off,
+        }
+    }
+
+    fn queue_behavior_label(&self) -> &'static str {
+        match self.playback.repeat_mode {
+            RepeatMode::Off => "plays once",
+            RepeatMode::All => "loops",
+        }
     }
 }
 
@@ -1634,6 +1655,7 @@ mod tests {
                     position_ms: 0,
                     current_queue_item_id: None,
                     playback_session_id: None,
+                    repeat_mode: RepeatMode::Off,
                 },
                 audio: AudioSettings::default(),
                 current_song: None,
@@ -1678,6 +1700,7 @@ mod tests {
                     position_ms: 0,
                     current_queue_item_id: None,
                     playback_session_id: None,
+                    repeat_mode: RepeatMode::Off,
                 },
                 audio: AudioSettings::default(),
                 current_song: None,
@@ -1718,6 +1741,7 @@ mod tests {
                     position_ms: 0,
                     current_queue_item_id: Some(String::from("queue_item_1")),
                     playback_session_id: Some(String::from("session_1")),
+                    repeat_mode: RepeatMode::Off,
                 },
                 audio: AudioSettings::default(),
                 current_song: None,
