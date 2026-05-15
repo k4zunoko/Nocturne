@@ -10,6 +10,8 @@ use crate::models::{
     BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreSnapshot,
     PlaybackProgressEvent, SearchJobCompletedEvent, SearchJobFailedEvent, SearchJobRecord,
     SearchJobStatus, SearchResultsRecord, StateUpdatedEvent, SystemErrorEvent, SystemErrorSeverity,
+    YoutubeImportCompletedEvent, YoutubeImportFailedEvent, YoutubeImportJobRecord,
+    YoutubeImportJobStatus,
 };
 use crate::ports::{
     ClockPort, EventPublisherPort, IdGeneratorPort, IdKind, PlaybackPort, PortError, SearchPort,
@@ -78,6 +80,7 @@ pub struct OrchestratorState {
     audio: AudioSettings,
     queue: Vec<QueueItem>,
     search_jobs: Vec<SearchJobRecord>,
+    youtube_import_jobs: Vec<YoutubeImportJobRecord>,
     search_results: BTreeMap<String, Vec<Song>>,
     revision: u64,
 }
@@ -100,6 +103,7 @@ impl Default for OrchestratorState {
             audio: AudioSettings::default(),
             queue: Vec::new(),
             search_jobs: Vec::new(),
+            youtube_import_jobs: Vec::new(),
             search_results: BTreeMap::new(),
             revision: 0,
         }
@@ -179,6 +183,7 @@ where
             current_song: self.current_song().cloned(),
             queue: self.state.queue.clone(),
             search_jobs: self.state.search_jobs.clone(),
+            youtube_import_jobs: self.state.youtube_import_jobs.clone(),
             revision: self.state.revision,
             snapshot_id: self.ids.next_id(IdKind::Snapshot),
             timestamp: self.clock.now(),
@@ -193,6 +198,11 @@ where
     #[must_use]
     pub fn search_jobs(&self) -> &[SearchJobRecord] {
         &self.state.search_jobs
+    }
+
+    #[must_use]
+    pub fn youtube_import_jobs(&self) -> &[YoutubeImportJobRecord] {
+        &self.state.youtube_import_jobs
     }
 
     #[must_use]
@@ -259,6 +269,39 @@ where
         self.command_accepted(Some(job_id), None)
     }
 
+    pub fn submit_youtube_import(
+        &mut self,
+        url: impl AsRef<str>,
+    ) -> Result<CommandReceipt, CoreError> {
+        let url = url.as_ref().trim();
+        if url.is_empty() {
+            return Err(CoreError::validation(
+                "youtube_url_empty",
+                "YouTube URL must not be empty",
+            ));
+        }
+
+        let job_id = self.ids.next_id(IdKind::YoutubeImportJob);
+        self.search.start_youtube_import(&job_id, url)?;
+
+        let summary = YoutubeImportJobRecord {
+            job_id: job_id.clone(),
+            status: YoutubeImportJobStatus::Running,
+            url: url.to_owned(),
+            created_at: self.clock.now(),
+            completed_at: None,
+            error_code: None,
+            error_message: None,
+        };
+        self.state.youtube_import_jobs.push(summary.clone());
+        self.publish(
+            CoreEventKind::YoutubeImportStarted,
+            CoreEvent::YoutubeImportStarted(summary),
+        )?;
+
+        self.command_accepted(Some(job_id), None)
+    }
+
     pub fn complete_search(&mut self, job_id: &str, results: Vec<Song>) -> Result<(), CoreError> {
         let completed_at = self.clock.now();
         let result_count = u64::try_from(results.len()).map_err(|_| {
@@ -312,6 +355,96 @@ where
         self.publish(
             CoreEventKind::SearchJobFailed,
             CoreEvent::SearchJobFailed(SearchJobFailedEvent {
+                job_id: job_id.to_owned(),
+                code,
+                message,
+            }),
+        )
+    }
+
+    pub fn complete_youtube_import(
+        &mut self,
+        job_id: &str,
+        song: Song,
+    ) -> Result<CommandReceipt, CoreError> {
+        let queue_len_before = self.state.queue.len();
+        let receipt = match self.enqueue_song(song.clone()) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if self.state.queue.len() > queue_len_before {
+                    self.state.queue.truncate(queue_len_before);
+                    self.normalize_queue_for_stop();
+                    self.state.playback.state = PlaybackStatus::Stopped;
+                    self.state.playback.position_ms = 0;
+                    self.state.playback.current_queue_item_id = None;
+                    self.state.playback.playback_session_id = None;
+                    let _ = self.publish_state_updated();
+                }
+                return Err(error);
+            }
+        };
+        let queue_item_id = receipt.queue_item_id.clone().ok_or_else(|| {
+            CoreError::conflict(
+                "queue_item_id_missing",
+                "queue item id was missing after enqueueing imported song",
+            )
+        })?;
+
+        let completed_at = self.clock.now();
+        let job = {
+            let job = self.find_youtube_import_job_mut(job_id)?;
+            if job.status != YoutubeImportJobStatus::Running {
+                return Err(CoreError::conflict(
+                    "youtube_import_job_not_running",
+                    "cannot complete a YouTube import job that is no longer running",
+                ));
+            }
+            job.status = YoutubeImportJobStatus::Completed;
+            job.completed_at = Some(completed_at);
+            job.error_code = None;
+            job.error_message = None;
+            job.clone()
+        };
+
+        self.publish(
+            CoreEventKind::YoutubeImportCompleted,
+            CoreEvent::YoutubeImportCompleted(YoutubeImportCompletedEvent {
+                job,
+                song,
+                queue_item_id,
+            }),
+        )?;
+
+        Ok(receipt)
+    }
+
+    pub fn fail_youtube_import(
+        &mut self,
+        job_id: &str,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Result<(), CoreError> {
+        let code = code.into();
+        let message = message.into();
+        let completed_at = self.clock.now();
+
+        {
+            let job = self.find_youtube_import_job_mut(job_id)?;
+            if job.status != YoutubeImportJobStatus::Running {
+                return Err(CoreError::conflict(
+                    "youtube_import_job_not_running",
+                    "cannot fail a YouTube import job that is no longer running",
+                ));
+            }
+            job.status = YoutubeImportJobStatus::Failed;
+            job.completed_at = Some(completed_at);
+            job.error_code = Some(code.clone());
+            job.error_message = Some(message.clone());
+        }
+
+        self.publish(
+            CoreEventKind::YoutubeImportFailed,
+            CoreEvent::YoutubeImportFailed(YoutubeImportFailedEvent {
                 job_id: job_id.to_owned(),
                 code,
                 message,
@@ -812,6 +945,17 @@ where
             .ok_or_else(|| CoreError::not_found("search_job", job_id))
     }
 
+    fn find_youtube_import_job_mut(
+        &mut self,
+        job_id: &str,
+    ) -> Result<&mut YoutubeImportJobRecord, CoreError> {
+        self.state
+            .youtube_import_jobs
+            .iter_mut()
+            .find(|job| job.job_id == job_id)
+            .ok_or_else(|| CoreError::not_found("youtube_import_job", job_id))
+    }
+
     fn find_song(&self, song_id: &str) -> Option<&Song> {
         self.state
             .search_results
@@ -916,6 +1060,7 @@ mod tests {
                 IdKind::PlaybackSession => "playback_session",
                 IdKind::QueueItem => "queue_item",
                 IdKind::SearchJob => "job",
+                IdKind::YoutubeImportJob => "youtube_import_job",
             };
             format!("{prefix}_{:04}", self.next)
         }
@@ -942,6 +1087,7 @@ mod tests {
         stopped: usize,
         seeks: Vec<u64>,
         fail_stop: bool,
+        fail_start: bool,
     }
 
     impl PlaybackPort for StubPlayback {
@@ -951,6 +1097,12 @@ mod tests {
             playback_session_id: &str,
             position_ms: u64,
         ) -> Result<(), PortError> {
+            if self.fail_start {
+                return Err(PortError::new(
+                    "audio_output_unavailable",
+                    "stub start failure",
+                ));
+            }
             self.started.push(format!(
                 "{}:{}@{}",
                 playback_session_id, item.id, position_ms
@@ -995,6 +1147,11 @@ mod tests {
     impl SearchPort for StubSearch {
         fn start_search(&mut self, job_id: &str, query: &str) -> Result<(), PortError> {
             self.started.push((job_id.to_owned(), query.to_owned()));
+            Ok(())
+        }
+
+        fn start_youtube_import(&mut self, job_id: &str, url: &str) -> Result<(), PortError> {
+            self.started.push((job_id.to_owned(), url.to_owned()));
             Ok(())
         }
     }
@@ -1137,6 +1294,51 @@ mod tests {
     }
 
     #[test]
+    fn youtube_import_lifecycle_enqueues_song() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        let accepted = orchestrator
+            .submit_youtube_import("https://www.youtube.com/watch?v=tuyZ9f6mHZk")
+            .unwrap();
+        let job_id = accepted.job_id.unwrap();
+
+        let receipt = orchestrator
+            .complete_youtube_import(&job_id, song("youtube:tuyZ9f6mHZk"))
+            .unwrap();
+
+        assert!(receipt.queue_item_id.is_some());
+        assert_eq!(orchestrator.queue().len(), 1);
+        assert_eq!(orchestrator.queue()[0].song.id, "youtube:tuyZ9f6mHZk");
+    }
+
+    #[test]
+    fn youtube_import_empty_url_is_rejected() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        let error = orchestrator.submit_youtube_import("   ").unwrap_err();
+
+        match error {
+            CoreError::Validation { code, message } => {
+                assert_eq!(code, "youtube_url_empty");
+                assert_eq!(message, "YouTube URL must not be empty");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
     fn full_search_to_play_flow_emits_expected_events() {
         let mut orchestrator = Orchestrator::new(
             StubClock,
@@ -1166,8 +1368,44 @@ mod tests {
         let snapshot = orchestrator.snapshot();
         assert_eq!(snapshot.queue.len(), 1);
         assert_eq!(snapshot.search_jobs.len(), 1);
+        assert_eq!(snapshot.youtube_import_jobs.len(), 0);
         assert_eq!(snapshot.playback.state, PlaybackStatus::Stopped);
         assert_eq!(snapshot.queue[0].status, QueueItemStatus::Queued);
+    }
+
+    #[test]
+    fn youtube_import_completion_does_not_mutate_queue_when_autoplay_fails() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback {
+                fail_start: true,
+                ..StubPlayback::default()
+            },
+            StubSearch::default(),
+        );
+
+        let job_id = orchestrator
+            .submit_youtube_import("https://www.youtube.com/watch?v=tuyZ9f6mHZk")
+            .unwrap()
+            .job_id
+            .unwrap();
+
+        let error = orchestrator
+            .complete_youtube_import(&job_id, song("youtube:tuyZ9f6mHZk"))
+            .unwrap_err();
+
+        match error {
+            CoreError::Port { code, .. } => assert_eq!(code, "audio_output_unavailable"),
+            other => panic!("unexpected error: {other}"),
+        }
+
+        assert!(orchestrator.queue().is_empty());
+        assert_eq!(
+            orchestrator.youtube_import_jobs()[0].status,
+            YoutubeImportJobStatus::Running
+        );
     }
 
     #[test]
