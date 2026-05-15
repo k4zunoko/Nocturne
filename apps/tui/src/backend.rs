@@ -13,7 +13,8 @@ use nocturne_api::{
     HEALTH_PATH, LAST_EVENT_ID_HEADER, PlaybackProgress, PlaybackRepeatRequest,
     PlaybackVolumeRequest, ProblemDetails, QueueAddRequest, QueueRemoveRequest, STATE_PATH,
     SearchCommandRequest, SearchJobCompleted, SearchJobFailed, SearchJobSummary,
-    SearchResultsResponse, StateSnapshot, SystemError,
+    SearchResultsResponse, StateSnapshot, SystemError, YoutubeImportCompleted, YoutubeImportFailed,
+    YoutubeImportJobSummary, YoutubeImportRequest,
 };
 use nocturne_domain::RepeatMode;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -28,6 +29,7 @@ const EVENT_CURSOR_NOT_FOUND_TYPE: &str = "https://nocturne.local/problems/event
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandAction {
     Search(String),
+    ImportYoutubeUrl(String),
     AddSong(String),
     PlayPause,
     Next,
@@ -41,6 +43,7 @@ pub enum CommandAction {
 pub enum CommandOutcome {
     StatusMessage(String),
     SearchSubmitted { job_id: String, query: String },
+    YoutubeImportSubmitted { job_id: String },
     SongQueued(String),
 }
 
@@ -69,6 +72,9 @@ pub enum BackendEventKind {
     SearchJobStarted(SearchJobSummary),
     SearchJobCompleted(SearchJobCompleted),
     SearchJobFailed(SearchJobFailed),
+    YoutubeImportStarted(YoutubeImportJobSummary),
+    YoutubeImportCompleted(YoutubeImportCompleted),
+    YoutubeImportFailed(YoutubeImportFailed),
     SystemError(SystemError),
 }
 
@@ -229,6 +235,22 @@ impl BackendClient {
                         .map(|job_id| CommandOutcome::SearchSubmitted { job_id, query })
                         .ok_or_else(|| {
                             String::from("search command was accepted but no job id was returned")
+                        })
+                }),
+            CommandAction::ImportYoutubeUrl(url) => self
+                .post_json(
+                    "/api/v1/commands/import/youtube",
+                    &YoutubeImportRequest { url: url.clone() },
+                )
+                .await
+                .and_then(|accepted| {
+                    accepted
+                        .job_id
+                        .map(|job_id| CommandOutcome::YoutubeImportSubmitted { job_id })
+                        .ok_or_else(|| {
+                            String::from(
+                                "youtube import command was accepted but no job id was returned",
+                            )
                         })
                 }),
             CommandAction::AddSong(song_id) => self
@@ -519,6 +541,23 @@ fn decode_backend_event(envelope: EventEnvelope<Value>) -> Result<Option<Backend
                 TuiError::new(format!("failed to decode search.job.failed: {error}"))
             })?,
         ),
+        "youtube.import.started" => BackendEventKind::YoutubeImportStarted(
+            serde_json::from_value::<YoutubeImportJobSummary>(envelope.data).map_err(|error| {
+                TuiError::new(format!("failed to decode youtube.import.started: {error}"))
+            })?,
+        ),
+        "youtube.import.completed" => BackendEventKind::YoutubeImportCompleted(
+            serde_json::from_value::<YoutubeImportCompleted>(envelope.data).map_err(|error| {
+                TuiError::new(format!(
+                    "failed to decode youtube.import.completed: {error}"
+                ))
+            })?,
+        ),
+        "youtube.import.failed" => BackendEventKind::YoutubeImportFailed(
+            serde_json::from_value::<YoutubeImportFailed>(envelope.data).map_err(|error| {
+                TuiError::new(format!("failed to decode youtube.import.failed: {error}"))
+            })?,
+        ),
         "system.error" => BackendEventKind::SystemError(
             serde_json::from_value::<SystemError>(envelope.data).map_err(|error| {
                 TuiError::new(format!("failed to decode system.error: {error}"))
@@ -708,6 +747,7 @@ mod tests {
                 current_song: None,
                 queue: Vec::new(),
                 search_jobs: Vec::new(),
+                youtube_import_jobs: Vec::new(),
                 revision: 1,
                 snapshot_id: String::from("snap_refresh"),
                 timestamp: String::from("2026-04-24T09:00:00Z"),

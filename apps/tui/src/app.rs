@@ -2,7 +2,10 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use nocturne_api::{BackendStatus, SearchJobStatus, SearchJobSummary, StateSnapshot};
+use nocturne_api::{
+    BackendStatus, SearchJobStatus, SearchJobSummary, StateSnapshot, YoutubeImportJobStatus,
+    YoutubeImportJobSummary,
+};
 use nocturne_domain::{
     AudioSettings, PlaybackState, PlaybackStatus, QueueItem, QueueItemStatus, RepeatMode, Song,
 };
@@ -90,6 +93,7 @@ pub struct App {
     current_song: Option<Song>,
     queue: Vec<QueueItem>,
     search_jobs: Vec<SearchJobSummary>,
+    youtube_import_jobs: Vec<YoutubeImportJobSummary>,
     overlay: Overlay,
     queue_selection: usize,
     pending_delete_confirmation: bool,
@@ -97,6 +101,7 @@ pub struct App {
     search_overlay: Option<SearchOverlay>,
     pending_search_terminal: Option<(String, PendingSearchTerminalState)>,
     pending_search_results_request: Option<String>,
+    pending_youtube_import_job_id: Option<String>,
     status_message: String,
     status_level: StatusLevel,
     last_event_id: Option<String>,
@@ -126,6 +131,7 @@ impl App {
             current_song: None,
             queue: Vec::new(),
             search_jobs: Vec::new(),
+            youtube_import_jobs: Vec::new(),
             overlay: Overlay::None,
             queue_selection: 0,
             pending_delete_confirmation: false,
@@ -133,6 +139,7 @@ impl App {
             search_overlay: None,
             pending_search_terminal: None,
             pending_search_results_request: None,
+            pending_youtube_import_job_id: None,
             status_message: String::from("Starting backend..."),
             status_level: StatusLevel::Info,
             last_event_id: None,
@@ -150,6 +157,7 @@ impl App {
         self.current_song = snapshot.current_song;
         self.queue = snapshot.queue;
         self.search_jobs = snapshot.search_jobs;
+        self.youtube_import_jobs = snapshot.youtube_import_jobs;
         self.last_event_id = current_event_id;
         self.sync_playback_anchor(self.playback.position_ms);
         self.playback_progress_confirmed =
@@ -161,6 +169,7 @@ impl App {
             format!("Connected to backend on http://{}", self.backend_addr),
         );
         self.reconcile_search_overlay_from_jobs();
+        self.reconcile_youtube_import_from_jobs();
     }
 
     pub fn apply_backend_event(&mut self, event: BackendEvent) {
@@ -174,12 +183,14 @@ impl App {
                 self.current_song = snapshot.current_song;
                 self.queue = snapshot.queue;
                 self.search_jobs = snapshot.search_jobs;
+                self.youtube_import_jobs = snapshot.youtube_import_jobs;
                 self.sync_playback_anchor(self.playback.position_ms);
                 self.playback_progress_confirmed =
                     self.playback.state == PlaybackStatus::Playing && self.playback.position_ms > 0;
                 self.sync_current_song_from_queue();
                 self.reconcile_queue_selection();
                 self.reconcile_search_overlay_from_jobs();
+                self.reconcile_youtube_import_from_jobs();
             }
             BackendEventKind::PlaybackProgress(payload) => {
                 if self.playback.playback_session_id.is_none() {
@@ -212,6 +223,33 @@ impl App {
                 }
                 self.apply_search_job_failed(payload.job_id, payload.message);
             }
+            BackendEventKind::YoutubeImportStarted(job) => {
+                self.upsert_youtube_import_job(job.clone());
+                self.pending_youtube_import_job_id = Some(job.job_id);
+                self.set_status(StatusLevel::Info, String::from("Resolving YouTube URL..."));
+            }
+            BackendEventKind::YoutubeImportCompleted(payload) => {
+                self.upsert_youtube_import_job(payload.job.clone());
+                self.pending_youtube_import_job_id = None;
+                self.input.clear();
+                self.set_status(
+                    StatusLevel::Info,
+                    format!("Added '{}' to queue.", payload.song.title),
+                );
+            }
+            BackendEventKind::YoutubeImportFailed(payload) => {
+                if let Some(job) = self
+                    .youtube_import_jobs
+                    .iter_mut()
+                    .find(|job| job.job_id == payload.job_id)
+                {
+                    job.status = YoutubeImportJobStatus::Failed;
+                    job.error_code = Some(payload.code.clone());
+                    job.error_message = Some(payload.message.clone());
+                }
+                self.pending_youtube_import_job_id = None;
+                self.set_status(StatusLevel::Error, payload.message);
+            }
             BackendEventKind::SystemError(payload) => {
                 let level = match payload.severity {
                     nocturne_api::SystemErrorSeverity::Warning => StatusLevel::Warning,
@@ -234,6 +272,10 @@ impl App {
                 if self.search_overlay_state() == Some(SearchOverlayState::Loading) {
                     self.set_status(StatusLevel::Info, String::from("Searching backend..."));
                 }
+            }
+            Ok(CommandOutcome::YoutubeImportSubmitted { job_id }) => {
+                self.pending_youtube_import_job_id = Some(job_id);
+                self.set_status(StatusLevel::Info, String::from("Resolving YouTube URL..."))
             }
             Ok(CommandOutcome::SongQueued(message)) => {
                 self.overlay = Overlay::None;
@@ -584,6 +626,10 @@ impl App {
             return self.handle_slash_command(command.trim());
         }
 
+        if is_likely_youtube_url(&text) {
+            return AppAction::Command(CommandAction::ImportYoutubeUrl(text));
+        }
+
         AppAction::Command(CommandAction::Search(text))
     }
 
@@ -613,6 +659,18 @@ impl App {
             *existing = job;
         } else {
             self.search_jobs.push(job);
+        }
+    }
+
+    fn upsert_youtube_import_job(&mut self, job: YoutubeImportJobSummary) {
+        if let Some(existing) = self
+            .youtube_import_jobs
+            .iter_mut()
+            .find(|existing| existing.job_id == job.job_id)
+        {
+            *existing = job;
+        } else {
+            self.youtube_import_jobs.push(job);
         }
     }
 
@@ -745,6 +803,46 @@ impl App {
             }
             SearchJobStatus::Queued | SearchJobStatus::Running => {
                 self.apply_pending_terminal_state();
+            }
+        }
+    }
+
+    fn reconcile_youtube_import_from_jobs(&mut self) {
+        let Some(job_id) = self.pending_youtube_import_job_id.clone() else {
+            return;
+        };
+
+        let Some(job) = self
+            .youtube_import_jobs
+            .iter()
+            .find(|job| job.job_id == job_id)
+            .cloned()
+        else {
+            return;
+        };
+
+        match job.status {
+            YoutubeImportJobStatus::Running => {
+                self.set_status(StatusLevel::Info, String::from("Resolving YouTube URL..."));
+            }
+            YoutubeImportJobStatus::Completed => {
+                self.pending_youtube_import_job_id = None;
+                self.input.clear();
+                self.set_status(
+                    StatusLevel::Info,
+                    String::from("Added YouTube video to queue."),
+                );
+            }
+            YoutubeImportJobStatus::Failed => {
+                self.pending_youtube_import_job_id = None;
+                self.set_status(
+                    StatusLevel::Error,
+                    job.error_message.unwrap_or_else(|| {
+                        String::from(
+                            "YouTube URL import failed. Reconnect completed without a detailed error.",
+                        )
+                    }),
+                );
             }
         }
     }
@@ -1408,6 +1506,18 @@ fn text_width(text: &str) -> u16 {
     text.chars().count().min(usize::from(u16::MAX)) as u16
 }
 
+fn is_likely_youtube_url(input: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(input) else {
+        return false;
+    };
+
+    let Some(host) = parsed.host_str().map(|host| host.to_ascii_lowercase()) else {
+        return false;
+    };
+
+    host == "youtu.be" || host == "youtube.com" || host.ends_with(".youtube.com")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1483,6 +1593,38 @@ mod tests {
         let search = app.search_overlay.as_ref().unwrap();
         assert_eq!(search.state, SearchOverlayState::Loading);
         assert_eq!(search.query, "utada traveling");
+    }
+
+    #[test]
+    fn youtube_url_submit_dispatches_import_command() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.input.text = String::from("https://youtu.be/tuyZ9f6mHZk");
+        app.input.move_end();
+
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(
+            action,
+            AppAction::Command(CommandAction::ImportYoutubeUrl(String::from(
+                "https://youtu.be/tuyZ9f6mHZk"
+            )))
+        );
+    }
+
+    #[test]
+    fn unsupported_youtube_url_still_dispatches_import_command() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.input.text = String::from("https://www.youtube.com/shorts/tuyZ9f6mHZk");
+        app.input.move_end();
+
+        let action = app.handle_key(KeyEvent::from(KeyCode::Enter));
+
+        assert_eq!(
+            action,
+            AppAction::Command(CommandAction::ImportYoutubeUrl(String::from(
+                "https://www.youtube.com/shorts/tuyZ9f6mHZk"
+            )))
+        );
     }
 
     #[test]
@@ -1668,6 +1810,7 @@ mod tests {
                     completed_at: Some(String::from("2026-04-24T00:00:05Z")),
                     result_count: None,
                 }],
+                youtube_import_jobs: Vec::new(),
                 revision: 1,
                 snapshot_id: String::from("snap_1"),
                 timestamp: String::from("2026-04-24T00:00:06Z"),
@@ -1713,6 +1856,7 @@ mod tests {
                     completed_at: Some(String::from("2026-04-24T00:00:05Z")),
                     result_count: Some(2),
                 }],
+                youtube_import_jobs: Vec::new(),
                 revision: 1,
                 snapshot_id: String::from("snap_1"),
                 timestamp: String::from("2026-04-24T00:00:06Z"),
@@ -1747,6 +1891,7 @@ mod tests {
                 current_song: None,
                 queue: vec![queue_item("queue_item_1", QueueItemStatus::Playing)],
                 search_jobs: Vec::new(),
+                youtube_import_jobs: Vec::new(),
                 revision: 1,
                 snapshot_id: String::from("snap_1"),
                 timestamp: String::from("2026-04-24T00:00:06Z"),
@@ -1851,5 +1996,136 @@ mod tests {
         assert_eq!(app.overlay, Overlay::None);
         assert!(app.search_overlay.is_none());
         assert!(app.input.text.is_empty());
+    }
+
+    #[test]
+    fn youtube_import_completion_clears_query_and_updates_status() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.input.text = String::from("https://youtu.be/tuyZ9f6mHZk");
+        app.input.move_end();
+
+        app.apply_command_result(Ok(CommandOutcome::YoutubeImportSubmitted {
+            job_id: String::from("youtube_import_job_1"),
+        }));
+        assert_eq!(app.status_message, "Resolving YouTube URL...");
+
+        app.apply_backend_event(crate::backend::BackendEvent {
+            event_id: String::from("evt_1"),
+            kind: crate::backend::BackendEventKind::YoutubeImportCompleted(
+                nocturne_api::YoutubeImportCompleted {
+                    job: nocturne_api::YoutubeImportJobSummary {
+                        job_id: String::from("youtube_import_job_1"),
+                        status: nocturne_api::YoutubeImportJobStatus::Completed,
+                        url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+                        created_at: String::from("2026-04-24T00:00:00Z"),
+                        completed_at: Some(String::from("2026-04-24T00:00:02Z")),
+                        error_code: None,
+                        error_message: None,
+                    },
+                    song: Song {
+                        id: String::from("youtube:tuyZ9f6mHZk"),
+                        title: String::from("traveling"),
+                        channel_name: String::from("Hikaru Utada"),
+                        duration_ms: 295_000,
+                        source_url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+                    },
+                    queue_item_id: String::from("queue_item_1"),
+                },
+            ),
+        });
+
+        assert!(app.input.text.is_empty());
+        assert_eq!(app.status_message, "Added 'traveling' to queue.");
+    }
+
+    #[test]
+    fn snapshot_recovers_completed_youtube_import_status() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.input.text = String::from("https://youtu.be/tuyZ9f6mHZk");
+        app.pending_youtube_import_job_id = Some(String::from("youtube_import_job_1"));
+
+        app.apply_snapshot(
+            StateSnapshot {
+                backend: BackendStatus {
+                    ready: true,
+                    version: Some(String::from("test")),
+                    yt_dlp_version: Some(String::from("2026.05.01")),
+                },
+                playback: PlaybackState {
+                    state: PlaybackStatus::Stopped,
+                    position_ms: 0,
+                    current_queue_item_id: None,
+                    playback_session_id: None,
+                    repeat_mode: RepeatMode::Off,
+                },
+                audio: AudioSettings::default(),
+                current_song: None,
+                queue: Vec::new(),
+                search_jobs: Vec::new(),
+                youtube_import_jobs: vec![YoutubeImportJobSummary {
+                    job_id: String::from("youtube_import_job_1"),
+                    status: YoutubeImportJobStatus::Completed,
+                    url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+                    created_at: String::from("2026-04-24T00:00:00Z"),
+                    completed_at: Some(String::from("2026-04-24T00:00:02Z")),
+                    error_code: None,
+                    error_message: None,
+                }],
+                revision: 1,
+                snapshot_id: String::from("snap_1"),
+                timestamp: String::from("2026-04-24T00:00:06Z"),
+            },
+            Some(String::from("evt_1")),
+        );
+
+        assert!(app.input.text.is_empty());
+        assert_eq!(app.status_message, "Added YouTube video to queue.");
+        assert!(app.pending_youtube_import_job_id.is_none());
+    }
+
+    #[test]
+    fn snapshot_recovers_failed_youtube_import_status() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.pending_youtube_import_job_id = Some(String::from("youtube_import_job_1"));
+
+        app.apply_snapshot(
+            StateSnapshot {
+                backend: BackendStatus {
+                    ready: true,
+                    version: Some(String::from("test")),
+                    yt_dlp_version: Some(String::from("2026.05.01")),
+                },
+                playback: PlaybackState {
+                    state: PlaybackStatus::Stopped,
+                    position_ms: 0,
+                    current_queue_item_id: None,
+                    playback_session_id: None,
+                    repeat_mode: RepeatMode::Off,
+                },
+                audio: AudioSettings::default(),
+                current_song: None,
+                queue: Vec::new(),
+                search_jobs: Vec::new(),
+                youtube_import_jobs: vec![YoutubeImportJobSummary {
+                    job_id: String::from("youtube_import_job_1"),
+                    status: YoutubeImportJobStatus::Failed,
+                    url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+                    created_at: String::from("2026-04-24T00:00:00Z"),
+                    completed_at: Some(String::from("2026-04-24T00:00:02Z")),
+                    error_code: Some(String::from("youtube_url_invalid")),
+                    error_message: Some(String::from("Input is not a valid YouTube video URL.")),
+                }],
+                revision: 1,
+                snapshot_id: String::from("snap_1"),
+                timestamp: String::from("2026-04-24T00:00:06Z"),
+            },
+            Some(String::from("evt_1")),
+        );
+
+        assert_eq!(
+            app.status_message,
+            "Input is not a valid YouTube video URL."
+        );
+        assert!(app.pending_youtube_import_job_id.is_none());
     }
 }
