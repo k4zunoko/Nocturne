@@ -20,19 +20,22 @@ use nocturne_api::{
     PlaybackVolumeRequest, ProblemDetails, QueueAddRequest, QueueMoveRequest, QueueRemoveRequest,
     QueueResponse, SearchCommandRequest, SearchJobCompleted, SearchJobFailed,
     SearchJobStatus as ApiSearchJobStatus, SearchJobSummary, SearchResultsResponse, StateSnapshot,
-    SystemError, SystemErrorSeverity,
+    SystemError, SystemErrorSeverity, YoutubeImportCompleted, YoutubeImportFailed,
+    YoutubeImportJobStatus as ApiYoutubeImportJobStatus, YoutubeImportJobSummary,
+    YoutubeImportRequest,
 };
 use nocturne_core::{
     CoreError, CoreEvent, CoreEventEnvelope, CoreSnapshot, NocturneCore, Orchestrator,
     SearchJobRecord, SearchJobStatus as CoreSearchJobStatus,
-    SystemErrorSeverity as CoreSystemErrorSeverity,
+    SystemErrorSeverity as CoreSystemErrorSeverity, YoutubeImportJobRecord,
+    YoutubeImportJobStatus as CoreYoutubeImportJobStatus,
 };
 use nocturne_domain::AudioSettings;
 use nocturne_infrastructure::{
     BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalAudioSettingsStore,
     LocalClock, LocalEventLog, LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter,
     LocalSearchRuntime, LocalYtDlpManager, LocalYtDlpSettingsStore, PlaybackWorkerEvent,
-    SharedPlaybackState,
+    SharedPlaybackState, canonicalize_supported_youtube_url,
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -159,7 +162,8 @@ fn spawn_search_worker(
 ) {
     tokio::spawn(async move {
         loop {
-            let processed = process_pending_search_jobs(&orchestrator, &search_runtime).await;
+            let processed = process_pending_search_jobs(&orchestrator, &search_runtime).await
+                + process_pending_youtube_import_jobs(&orchestrator, &search_runtime).await;
             let delay = if processed == 0 {
                 Duration::from_millis(100)
             } else {
@@ -332,6 +336,102 @@ async fn process_pending_search_jobs(
     pending_jobs.len()
 }
 
+async fn process_pending_youtube_import_jobs(
+    orchestrator: &Arc<Mutex<BackendOrchestrator>>,
+    search_runtime: &LocalSearchRuntime,
+) -> usize {
+    let pending_jobs = search_runtime.drain_pending_youtube_imports();
+
+    for job in &pending_jobs {
+        let runtime = search_runtime.clone();
+        let url = job.url.clone();
+        let result = tokio::task::spawn_blocking(move || runtime.resolve_youtube_url(&url)).await;
+
+        let mut orchestrator = orchestrator.lock().await;
+        match result {
+            Ok(Ok(song)) => {
+                if let Err(error) = orchestrator.complete_youtube_import(&job.job_id, song) {
+                    let code = core_error_code(&error).to_owned();
+                    let user_message = user_message_for_youtube_import_completion_error(&error);
+                    let should_emit_system_error = matches!(
+                        code.as_str(),
+                        "yt_dlp_missing"
+                            | "yt_dlp_spawn_failed"
+                            | "yt_dlp_timeout"
+                            | "audio_output_unavailable"
+                            | "audio_source_resolve_failed"
+                            | "playback_stream_open_failed"
+                            | "playback_decode_failed"
+                            | "playback_worker_unavailable"
+                    );
+
+                    if let Err(report_error) =
+                        orchestrator.fail_youtube_import(&job.job_id, &code, user_message)
+                    {
+                        eprintln!(
+                            "failed to convert youtube import completion error for {}: {report_error}",
+                            job.job_id
+                        );
+                    }
+
+                    if should_emit_system_error
+                        && let Err(report_error) = orchestrator.emit_system_error(
+                            &code,
+                            user_message,
+                            CoreSystemErrorSeverity::Error,
+                        )
+                    {
+                        eprintln!(
+                            "failed to emit system error for youtube import {}: {report_error}",
+                            job.job_id
+                        );
+                    }
+                }
+            }
+            Ok(Err(failure)) => {
+                let user_message = user_message_for_youtube_import_failure(&failure.code);
+                let should_emit_system_error = matches!(
+                    failure.code.as_str(),
+                    "yt_dlp_missing" | "yt_dlp_spawn_failed" | "yt_dlp_timeout"
+                );
+
+                if let Err(error) =
+                    orchestrator.fail_youtube_import(&job.job_id, &failure.code, user_message)
+                {
+                    eprintln!("failed to fail youtube import job {}: {error}", job.job_id);
+                }
+
+                if should_emit_system_error
+                    && let Err(error) = orchestrator.emit_system_error(
+                        &failure.code,
+                        user_message,
+                        CoreSystemErrorSeverity::Error,
+                    )
+                {
+                    eprintln!(
+                        "failed to emit system error for youtube import {}: {error}",
+                        job.job_id
+                    );
+                }
+            }
+            Err(error) => {
+                if let Err(report_error) = orchestrator.fail_youtube_import(
+                    &job.job_id,
+                    "youtube_import_worker_join_failed",
+                    error.to_string(),
+                ) {
+                    eprintln!(
+                        "failed to report youtube import join error for {}: {report_error}",
+                        job.job_id
+                    );
+                }
+            }
+        }
+    }
+
+    pending_jobs.len()
+}
+
 fn user_message_for_search_failure(code: &str) -> &'static str {
     match code {
         "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
@@ -342,6 +442,39 @@ fn user_message_for_search_failure(code: &str) -> &'static str {
         }
         "yt_dlp_failed" => "Search provider failed to return results.",
         _ => "Search failed on the backend.",
+    }
+}
+
+fn user_message_for_youtube_import_failure(code: &str) -> &'static str {
+    match code {
+        "youtube_url_invalid" => "Input is not a valid YouTube video URL.",
+        "youtube_url_unsupported" => "This YouTube URL format is not supported yet.",
+        "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
+        "yt_dlp_spawn_failed" => "The backend could not start YouTube URL resolution.",
+        "yt_dlp_timeout" => "YouTube URL resolution timed out.",
+        "yt_dlp_invalid_json" | "yt_dlp_invalid_response" => {
+            "The backend could not read metadata for this YouTube video."
+        }
+        "yt_dlp_failed" => "The backend failed to resolve this YouTube video.",
+        _ => "YouTube URL import failed on the backend.",
+    }
+}
+
+fn user_message_for_youtube_import_completion_error(error: &CoreError) -> &'static str {
+    match error {
+        CoreError::Port { code, .. } => user_message_for_playback_failure(code),
+        CoreError::Validation { code, .. } | CoreError::Conflict { code, .. } => {
+            user_message_for_youtube_import_failure(code)
+        }
+        CoreError::NotFound { .. } => "YouTube URL import failed on the backend.",
+    }
+}
+
+fn core_error_code(error: &CoreError) -> &str {
+    match error {
+        CoreError::Validation { code, .. } | CoreError::Conflict { code, .. } => code,
+        CoreError::Port { code, .. } => code,
+        CoreError::NotFound { kind, .. } => kind,
     }
 }
 
@@ -385,6 +518,10 @@ fn app_router(state: AppState) -> Router {
         .route("/api/v1/queue", get(queue_handler))
         .route("/api/v1/playback", get(playback_handler))
         .route("/api/v1/commands/search", post(search_command_handler))
+        .route(
+            "/api/v1/commands/import/youtube",
+            post(youtube_import_command_handler),
+        )
         .route("/api/v1/commands/queue/add", post(queue_add_handler))
         .route("/api/v1/commands/queue/remove", post(queue_remove_handler))
         .route("/api/v1/commands/queue/move", post(queue_move_handler))
@@ -527,6 +664,23 @@ async fn search_command_handler(
             queue_item_id: receipt.queue_item_id,
         }),
     ))
+}
+
+async fn youtube_import_command_handler(
+    State(state): State<AppState>,
+    request: Result<ExtractJson<YoutubeImportRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CommandAccepted>), (StatusCode, Json<ProblemDetails>)> {
+    let ExtractJson(request) =
+        request.map_err(|error| map_json_rejection(error, "/api/v1/commands/import/youtube"))?;
+    let canonical_url = canonicalize_supported_youtube_url(&request.url).map_err(|error| {
+        map_youtube_import_request_error(error, "/api/v1/commands/import/youtube")
+    })?;
+    let mut orchestrator = state.orchestrator.lock().await;
+    let receipt = orchestrator
+        .submit_youtube_import(canonical_url)
+        .map_err(|error| map_core_error(error, "/api/v1/commands/import/youtube"))?;
+
+    Ok(command_accepted_response(receipt))
 }
 
 async fn queue_handler(State(state): State<AppState>) -> Json<QueueResponse> {
@@ -827,6 +981,11 @@ fn map_state_snapshot(snapshot: CoreSnapshot) -> StateSnapshot {
             .into_iter()
             .map(map_search_job_summary)
             .collect(),
+        youtube_import_jobs: snapshot
+            .youtube_import_jobs
+            .into_iter()
+            .map(map_youtube_import_job_summary)
+            .collect(),
         revision: snapshot.revision,
         snapshot_id: snapshot.snapshot_id,
         timestamp: snapshot.timestamp,
@@ -885,6 +1044,29 @@ fn map_server_event(core: CoreEvent) -> (EventName, Value) {
             })
             .expect("search job failed event should serialize"),
         ),
+        CoreEvent::YoutubeImportStarted(job) => (
+            EventName::YoutubeImportStarted,
+            serde_json::to_value(map_youtube_import_job_summary(job))
+                .expect("youtube import started event should serialize"),
+        ),
+        CoreEvent::YoutubeImportCompleted(event) => (
+            EventName::YoutubeImportCompleted,
+            serde_json::to_value(YoutubeImportCompleted {
+                job: map_youtube_import_job_summary(event.job),
+                song: event.song,
+                queue_item_id: event.queue_item_id,
+            })
+            .expect("youtube import completed event should serialize"),
+        ),
+        CoreEvent::YoutubeImportFailed(event) => (
+            EventName::YoutubeImportFailed,
+            serde_json::to_value(YoutubeImportFailed {
+                job_id: event.job_id,
+                code: event.code,
+                message: event.message,
+            })
+            .expect("youtube import failed event should serialize"),
+        ),
         CoreEvent::SystemError(event) => (
             EventName::SystemError,
             serde_json::to_value(SystemError {
@@ -927,6 +1109,43 @@ fn map_search_job_status(status: CoreSearchJobStatus) -> ApiSearchJobStatus {
         CoreSearchJobStatus::Running => ApiSearchJobStatus::Running,
         CoreSearchJobStatus::Completed => ApiSearchJobStatus::Completed,
         CoreSearchJobStatus::Failed => ApiSearchJobStatus::Failed,
+    }
+}
+
+fn map_youtube_import_job_summary(job: YoutubeImportJobRecord) -> YoutubeImportJobSummary {
+    YoutubeImportJobSummary {
+        job_id: job.job_id,
+        status: map_youtube_import_job_status(job.status),
+        url: job.url,
+        created_at: job.created_at,
+        completed_at: job.completed_at,
+        error_code: job.error_code,
+        error_message: job.error_message,
+    }
+}
+
+fn map_youtube_import_request_error(
+    error: nocturne_infrastructure::LocalSearchFailure,
+    instance: &str,
+) -> (StatusCode, Json<ProblemDetails>) {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ProblemDetails {
+            r#type: format!("https://nocturne.local/problems/{}", error.code),
+            title: String::from("request validation failed"),
+            status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+            detail: error.message,
+            instance: Some(String::from(instance)),
+            errors: Vec::new(),
+        }),
+    )
+}
+
+fn map_youtube_import_job_status(status: CoreYoutubeImportJobStatus) -> ApiYoutubeImportJobStatus {
+    match status {
+        CoreYoutubeImportJobStatus::Running => ApiYoutubeImportJobStatus::Running,
+        CoreYoutubeImportJobStatus::Completed => ApiYoutubeImportJobStatus::Completed,
+        CoreYoutubeImportJobStatus::Failed => ApiYoutubeImportJobStatus::Failed,
     }
 }
 
@@ -1073,7 +1292,7 @@ mod tests {
     use axum::http::{Request, StatusCode};
     use nocturne_api::{
         PlaybackSeekRequest, PlaybackVolumeRequest, QueueAddRequest, QueueMoveRequest,
-        QueueRemoveRequest, QueueResponse,
+        QueueRemoveRequest, QueueResponse, YoutubeImportRequest,
     };
     use nocturne_core::{
         CoreEventKind, EventPublisherPort, SystemErrorEvent, SystemErrorSeverity as CoreSeverity,
@@ -1360,6 +1579,111 @@ mod tests {
         assert_eq!(results.job.status, CoreSearchJobStatus::Completed);
         assert_eq!(results.results.len(), 1);
         assert_eq!(results.results[0].title, "Worker Fixture Song");
+    }
+
+    #[tokio::test]
+    async fn pending_youtube_import_jobs_are_completed_by_worker_helper() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 8);
+        let search_runtime = LocalSearchRuntime::default();
+        search_runtime.set_fixture(
+            "https://www.youtube.com/watch?v=tuyZ9f6mHZk",
+            vec![Song {
+                id: String::from("youtube:tuyZ9f6mHZk"),
+                title: String::from("traveling"),
+                channel_name: String::from("Hikaru Utada"),
+                duration_ms: 295_000,
+                source_url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+            }],
+        );
+
+        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher,
+            test_playback_adapter(),
+            LocalSearchAdapter::new(search_runtime.clone()),
+        )));
+
+        {
+            let mut locked = orchestrator.lock().await;
+            locked
+                .submit_youtube_import("https://www.youtube.com/watch?v=tuyZ9f6mHZk")
+                .unwrap();
+        }
+
+        let processed = process_pending_youtube_import_jobs(&orchestrator, &search_runtime).await;
+        assert_eq!(processed, 1);
+
+        let locked = orchestrator.lock().await;
+        assert_eq!(locked.queue().len(), 1);
+        assert_eq!(locked.queue()[0].song.id, "youtube:tuyZ9f6mHZk");
+        drop(locked);
+
+        let snapshot = event_log.snapshot();
+        assert!(
+            snapshot
+                .iter()
+                .any(|event| event.event == "youtube.import.completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn youtube_import_endpoint_canonicalizes_short_urls_before_job_submission() {
+        let search_runtime = LocalSearchRuntime::default();
+        search_runtime.set_fixture(
+            "https://www.youtube.com/watch?v=tuyZ9f6mHZk",
+            vec![Song {
+                id: String::from("youtube:tuyZ9f6mHZk"),
+                title: String::from("traveling"),
+                channel_name: String::from("Hikaru Utada"),
+                duration_ms: 295_000,
+                source_url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+            }],
+        );
+
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            test_playback_adapter(),
+            LocalSearchAdapter::new(search_runtime.clone()),
+        )));
+
+        let app = app_router(AppState {
+            orchestrator: orchestrator.clone(),
+            events: event_publisher,
+            settings_store: test_settings_store(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/import/youtube")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&YoutubeImportRequest {
+                            url: String::from("https://youtu.be/tuyZ9f6mHZk?list=PL1234567890"),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        let locked = orchestrator.lock().await;
+        assert_eq!(locked.youtube_import_jobs().len(), 1);
+        assert_eq!(
+            locked.youtube_import_jobs()[0].url,
+            "https://www.youtube.com/watch?v=tuyZ9f6mHZk"
+        );
     }
 
     #[tokio::test]
@@ -1665,6 +1989,98 @@ mod tests {
 
         let results = orchestrator.lock().await.search_results(&job_id).unwrap();
         assert_eq!(results.results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn youtube_import_endpoint_accepts_url_and_enqueues_song() {
+        let search_runtime = LocalSearchRuntime::default();
+        search_runtime.set_fixture(
+            "https://www.youtube.com/watch?v=tuyZ9f6mHZk",
+            vec![Song {
+                id: String::from("youtube:tuyZ9f6mHZk"),
+                title: String::from("traveling"),
+                channel_name: String::from("Hikaru Utada"),
+                duration_ms: 295_000,
+                source_url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+            }],
+        );
+
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
+        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            test_playback_adapter(),
+            LocalSearchAdapter::new(search_runtime.clone()),
+        )));
+
+        let app = app_router(AppState {
+            orchestrator: orchestrator.clone(),
+            events: event_publisher,
+            settings_store: test_settings_store(),
+        });
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/import/youtube")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&YoutubeImportRequest {
+                            url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        process_pending_youtube_import_jobs(&orchestrator, &search_runtime).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/queue")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: QueueResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload.items.len(), 1);
+        assert_eq!(
+            payload.items[0].song.source_url,
+            "https://www.youtube.com/watch?v=tuyZ9f6mHZk"
+        );
+    }
+
+    #[tokio::test]
+    async fn youtube_import_endpoint_rejects_unknown_fields() {
+        let app = app_router(test_state());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/commands/import/youtube")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"url":"https://youtu.be/tuyZ9f6mHZk","extra":true}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]
