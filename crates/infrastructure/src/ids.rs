@@ -22,6 +22,7 @@ impl IdGeneratorPort for LocalIdGenerator {
             IdKind::PlaybackSession => "playback_session",
             IdKind::QueueItem => "queue_item",
             IdKind::SearchJob => "job",
+            IdKind::YoutubeImportJob => "youtube_import_job",
         };
 
         format!("{prefix}_{:04}", self.next)

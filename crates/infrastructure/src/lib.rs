@@ -16,7 +16,10 @@ pub use audio::{
 pub use clock::LocalClock;
 pub use events::{BroadcastEventPublisher, EventCursorError, LocalEventLog, LocalEventPublisher};
 pub use ids::LocalIdGenerator;
-pub use search::{LocalSearchAdapter, LocalSearchFailure, LocalSearchRuntime, PendingSearchJob};
+pub use search::{
+    LocalSearchAdapter, LocalSearchFailure, LocalSearchRuntime, PendingSearchJob,
+    PendingYoutubeImportJob, canonicalize_supported_youtube_url,
+};
 pub use settings::LocalAudioSettingsStore;
 pub use yt_dlp::{
     DEFAULT_WINDOWS_YT_DLP_PATH, LocalYtDlpManager, LocalYtDlpSettings, LocalYtDlpSettingsStore,
