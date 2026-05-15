@@ -13,6 +13,7 @@ pub enum IdKind {
     PlaybackSession,
     QueueItem,
     SearchJob,
+    YoutubeImportJob,
 }
 
 pub trait ClockPort {
@@ -82,4 +83,6 @@ pub trait PlaybackPort {
 
 pub trait SearchPort {
     fn start_search(&mut self, job_id: &str, query: &str) -> Result<(), PortError>;
+
+    fn start_youtube_import(&mut self, job_id: &str, url: &str) -> Result<(), PortError>;
 }

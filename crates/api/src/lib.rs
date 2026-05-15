@@ -57,6 +57,25 @@ pub struct SearchJobSummary {
     pub result_count: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum YoutubeImportJobStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YoutubeImportJobSummary {
+    pub job_id: Id,
+    pub status: YoutubeImportJobStatus,
+    pub url: String,
+    pub created_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendStatus {
     pub ready: bool,
@@ -80,6 +99,7 @@ pub struct StateSnapshot {
     pub current_song: Option<Song>,
     pub queue: Vec<QueueItem>,
     pub search_jobs: Vec<SearchJobSummary>,
+    pub youtube_import_jobs: Vec<YoutubeImportJobSummary>,
     pub revision: u64,
     pub snapshot_id: Id,
     pub timestamp: Timestamp,
@@ -121,6 +141,12 @@ pub struct SearchCommandRequest {
 pub struct SearchResultsResponse {
     pub job: SearchJobSummary,
     pub results: Vec<Song>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct YoutubeImportRequest {
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,6 +231,20 @@ pub struct SearchJobFailed {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YoutubeImportCompleted {
+    pub job: YoutubeImportJobSummary,
+    pub song: Song,
+    pub queue_item_id: Id,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YoutubeImportFailed {
+    pub job_id: Id,
+    pub code: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SystemError {
     pub code: String,
@@ -221,6 +261,9 @@ pub enum EventName {
     SearchJobStarted,
     SearchJobCompleted,
     SearchJobFailed,
+    YoutubeImportStarted,
+    YoutubeImportCompleted,
+    YoutubeImportFailed,
     SystemError,
 }
 
@@ -232,6 +275,9 @@ impl Display for EventName {
             Self::SearchJobStarted => "search.job.started",
             Self::SearchJobCompleted => "search.job.completed",
             Self::SearchJobFailed => "search.job.failed",
+            Self::YoutubeImportStarted => "youtube.import.started",
+            Self::YoutubeImportCompleted => "youtube.import.completed",
+            Self::YoutubeImportFailed => "youtube.import.failed",
             Self::SystemError => "system.error",
         };
 
@@ -272,6 +318,12 @@ pub enum ServerEvent {
     SearchJobCompleted(SearchJobCompleted),
     #[serde(rename = "search.job.failed")]
     SearchJobFailed(SearchJobFailed),
+    #[serde(rename = "youtube.import.started")]
+    YoutubeImportStarted(YoutubeImportJobSummary),
+    #[serde(rename = "youtube.import.completed")]
+    YoutubeImportCompleted(YoutubeImportCompleted),
+    #[serde(rename = "youtube.import.failed")]
+    YoutubeImportFailed(YoutubeImportFailed),
     #[serde(rename = "system.error")]
     SystemError(SystemError),
 }

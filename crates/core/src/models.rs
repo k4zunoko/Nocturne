@@ -36,6 +36,24 @@ pub struct SearchResultsRecord {
     pub results: Vec<Song>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YoutubeImportJobStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YoutubeImportJobRecord {
+    pub job_id: CoreId,
+    pub status: YoutubeImportJobStatus,
+    pub url: String,
+    pub created_at: CoreTimestamp,
+    pub completed_at: Option<CoreTimestamp>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CoreSnapshot {
     pub backend: BackendState,
@@ -44,6 +62,7 @@ pub struct CoreSnapshot {
     pub current_song: Option<Song>,
     pub queue: Vec<QueueItem>,
     pub search_jobs: Vec<SearchJobRecord>,
+    pub youtube_import_jobs: Vec<YoutubeImportJobRecord>,
     pub revision: u64,
     pub snapshot_id: CoreId,
     pub timestamp: CoreTimestamp,
@@ -88,6 +107,20 @@ pub struct SearchJobFailedEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YoutubeImportCompletedEvent {
+    pub job: YoutubeImportJobRecord,
+    pub song: Song,
+    pub queue_item_id: CoreId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YoutubeImportFailedEvent {
+    pub job_id: CoreId,
+    pub code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SystemErrorEvent {
     pub code: String,
     pub message: String,
@@ -101,6 +134,9 @@ pub enum CoreEvent {
     SearchJobStarted(SearchJobRecord),
     SearchJobCompleted(SearchJobCompletedEvent),
     SearchJobFailed(SearchJobFailedEvent),
+    YoutubeImportStarted(YoutubeImportJobRecord),
+    YoutubeImportCompleted(YoutubeImportCompletedEvent),
+    YoutubeImportFailed(YoutubeImportFailedEvent),
     SystemError(SystemErrorEvent),
 }
 
@@ -111,6 +147,9 @@ pub enum CoreEventKind {
     SearchJobStarted,
     SearchJobCompleted,
     SearchJobFailed,
+    YoutubeImportStarted,
+    YoutubeImportCompleted,
+    YoutubeImportFailed,
     SystemError,
 }
 
@@ -122,6 +161,9 @@ impl Display for CoreEventKind {
             Self::SearchJobStarted => "search.job.started",
             Self::SearchJobCompleted => "search.job.completed",
             Self::SearchJobFailed => "search.job.failed",
+            Self::YoutubeImportStarted => "youtube.import.started",
+            Self::YoutubeImportCompleted => "youtube.import.completed",
+            Self::YoutubeImportFailed => "youtube.import.failed",
             Self::SystemError => "system.error",
         };
 

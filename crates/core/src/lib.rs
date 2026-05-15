@@ -13,7 +13,8 @@ pub use models::{
     BackendState, CommandReceipt, CoreEvent, CoreEventEnvelope, CoreEventKind, CoreId,
     CoreSnapshot, CoreTimestamp, PlaybackProgressEvent, SearchJobCompletedEvent,
     SearchJobFailedEvent, SearchJobRecord, SearchJobStatus, SearchResultsRecord, StateUpdatedEvent,
-    SystemErrorEvent, SystemErrorSeverity,
+    SystemErrorEvent, SystemErrorSeverity, YoutubeImportCompletedEvent, YoutubeImportFailedEvent,
+    YoutubeImportJobRecord, YoutubeImportJobStatus,
 };
 pub use orchestrator::{CoreError, Orchestrator};
 pub use ports::{
