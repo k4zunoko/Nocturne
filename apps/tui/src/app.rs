@@ -21,6 +21,7 @@ use crate::backend::{
 };
 
 const MAX_SEARCH_RESULTS: usize = 5;
+const INPUT_HELPER_SUCCESS_TICKS: u8 = 8;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -78,6 +79,29 @@ enum StatusLevel {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputHelperKind {
+    PendingSearch,
+    PendingYoutubeImport,
+    Notice,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputHelper {
+    kind: InputHelperKind,
+    message: String,
+    level: StatusLevel,
+    ttl_ticks: Option<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedInputHelper {
+    message: String,
+    level: StatusLevel,
+    badge: Option<&'static str>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppAction {
     None,
@@ -102,6 +126,8 @@ pub struct App {
     pending_search_terminal: Option<(String, PendingSearchTerminalState)>,
     pending_search_results_request: Option<String>,
     pending_youtube_import_job_id: Option<String>,
+    pending_youtube_import_input: Option<String>,
+    input_helper: Option<InputHelper>,
     status_message: String,
     status_level: StatusLevel,
     last_event_id: Option<String>,
@@ -140,6 +166,8 @@ impl App {
             pending_search_terminal: None,
             pending_search_results_request: None,
             pending_youtube_import_job_id: None,
+            pending_youtube_import_input: None,
+            input_helper: None,
             status_message: String::from("Starting backend..."),
             status_level: StatusLevel::Info,
             last_event_id: None,
@@ -170,6 +198,7 @@ impl App {
         );
         self.reconcile_search_overlay_from_jobs();
         self.reconcile_youtube_import_from_jobs();
+        self.refresh_input_helper();
     }
 
     pub fn apply_backend_event(&mut self, event: BackendEvent) {
@@ -191,6 +220,7 @@ impl App {
                 self.reconcile_queue_selection();
                 self.reconcile_search_overlay_from_jobs();
                 self.reconcile_youtube_import_from_jobs();
+                self.refresh_input_helper();
             }
             BackendEventKind::PlaybackProgress(payload) => {
                 if self.playback.playback_session_id.is_none() {
@@ -227,15 +257,38 @@ impl App {
                 self.upsert_youtube_import_job(job.clone());
                 self.pending_youtube_import_job_id = Some(job.job_id);
                 self.set_status(StatusLevel::Info, String::from("Resolving YouTube URL..."));
+                self.set_input_helper(
+                    InputHelperKind::PendingYoutubeImport,
+                    String::from("Resolving YouTube URL..."),
+                    StatusLevel::Warning,
+                    None,
+                );
             }
             BackendEventKind::YoutubeImportCompleted(payload) => {
                 self.upsert_youtube_import_job(payload.job.clone());
                 self.pending_youtube_import_job_id = None;
-                self.input.clear();
+                let completed_input = self.pending_youtube_import_input.take();
+                let should_replace_helper =
+                    self.should_show_pending_youtube_feedback(completed_input.as_deref());
+                if completed_input.is_none()
+                    || matches!(completed_input.as_deref(), Some(input) if self.input.text.trim() == input)
+                {
+                    self.input.clear();
+                }
                 self.set_status(
                     StatusLevel::Info,
                     format!("Added '{}' to queue.", payload.song.title),
                 );
+                if should_replace_helper {
+                    self.set_input_helper(
+                        InputHelperKind::Notice,
+                        format!("Added '{}' to queue.", payload.song.title),
+                        StatusLevel::Info,
+                        Some(INPUT_HELPER_SUCCESS_TICKS),
+                    );
+                } else {
+                    self.refresh_input_helper();
+                }
             }
             BackendEventKind::YoutubeImportFailed(payload) => {
                 if let Some(job) = self
@@ -248,7 +301,18 @@ impl App {
                     job.error_message = Some(payload.message.clone());
                 }
                 self.pending_youtube_import_job_id = None;
+                let failed_input = self.pending_youtube_import_input.take();
                 self.set_status(StatusLevel::Error, payload.message);
+                if self.should_show_pending_youtube_feedback(failed_input.as_deref()) {
+                    self.set_input_helper(
+                        InputHelperKind::Error,
+                        self.status_message.clone(),
+                        StatusLevel::Error,
+                        None,
+                    );
+                } else {
+                    self.refresh_input_helper();
+                }
             }
             BackendEventKind::SystemError(payload) => {
                 let level = match payload.severity {
@@ -266,6 +330,12 @@ impl App {
                 self.set_status(StatusLevel::Info, message)
             }
             Ok(CommandOutcome::SearchSubmitted { job_id, query }) => {
+                self.set_input_helper(
+                    InputHelperKind::PendingSearch,
+                    String::from("Searching backend for candidates..."),
+                    StatusLevel::Warning,
+                    None,
+                );
                 self.open_search_overlay(job_id, query);
                 self.apply_pending_terminal_state();
                 self.reconcile_search_overlay_from_jobs();
@@ -275,15 +345,30 @@ impl App {
             }
             Ok(CommandOutcome::YoutubeImportSubmitted { job_id }) => {
                 self.pending_youtube_import_job_id = Some(job_id);
-                self.set_status(StatusLevel::Info, String::from("Resolving YouTube URL..."))
+                if self.pending_youtube_import_input.is_none()
+                    && is_likely_youtube_url(self.input.text.trim())
+                {
+                    self.pending_youtube_import_input = Some(self.input.text.trim().to_owned());
+                }
+                self.set_status(StatusLevel::Info, String::from("Resolving YouTube URL..."));
+                self.set_input_helper(
+                    InputHelperKind::PendingYoutubeImport,
+                    String::from("Resolving YouTube URL..."),
+                    StatusLevel::Warning,
+                    None,
+                );
             }
             Ok(CommandOutcome::SongQueued(message)) => {
                 self.overlay = Overlay::None;
                 self.search_overlay = None;
                 self.input.clear();
                 self.set_status(StatusLevel::Info, message);
+                self.input_helper = None;
             }
-            Err(message) => self.set_status(StatusLevel::Error, message),
+            Err(message) => {
+                self.set_status(StatusLevel::Error, message.clone());
+                self.set_input_helper(InputHelperKind::Error, message, StatusLevel::Error, None);
+            }
         }
     }
 
@@ -306,6 +391,7 @@ impl App {
 
     pub fn tick(&mut self) {
         self.display_position_ms = self.current_display_position_ms();
+        self.tick_input_helper();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> AppAction {
@@ -336,7 +422,13 @@ impl App {
         }
 
         match self.overlay {
-            Overlay::None => self.handle_input_key(key),
+            Overlay::None => {
+                let action = self.handle_input_key(key);
+                if let AppAction::Command(CommandAction::ImportYoutubeUrl(url)) = &action {
+                    self.pending_youtube_import_input = Some(url.clone());
+                }
+                action
+            }
             Overlay::Queue => self.handle_queue_overlay_key(key),
             Overlay::Search => self.handle_search_overlay_key(key),
             Overlay::Help => self.handle_help_overlay_key(key),
@@ -379,7 +471,8 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent) -> AppAction {
-        match key.code {
+        let previous_text = self.input.text.clone();
+        let action = match key.code {
             KeyCode::Enter => self.submit_input(),
             KeyCode::Backspace => {
                 self.input.delete_before_cursor();
@@ -412,7 +505,14 @@ impl App {
                 AppAction::None
             }
             _ => AppAction::None,
+        };
+
+        if self.input.text != previous_text {
+            self.clear_editable_input_helper();
         }
+
+        self.refresh_input_helper();
+        action
     }
 
     fn handle_queue_overlay_key(&mut self, key: KeyEvent) -> AppAction {
@@ -474,6 +574,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     search.closed = true;
                     self.overlay = Overlay::None;
+                    self.refresh_input_helper();
                     AppAction::None
                 }
                 _ => AppAction::None,
@@ -482,6 +583,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     search.closed = true;
                     self.overlay = Overlay::None;
+                    self.refresh_input_helper();
                     AppAction::None
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -503,6 +605,7 @@ impl App {
                     search.closed = true;
                     self.overlay = Overlay::None;
                     self.input.clear();
+                    self.input_helper = None;
                     AppAction::None
                 }
                 _ => AppAction::None,
@@ -525,6 +628,7 @@ impl App {
         self.overlay = Overlay::Queue;
         self.pending_delete_confirmation = false;
         self.queue_selection = self.initial_queue_selection();
+        self.refresh_input_helper();
     }
 
     fn open_search_overlay(&mut self, job_id: String, query: String) {
@@ -538,6 +642,7 @@ impl App {
             closed: false,
         });
         self.overlay = Overlay::Search;
+        self.refresh_input_helper();
     }
 
     fn search_overlay_state(&self) -> Option<SearchOverlayState> {
@@ -555,6 +660,7 @@ impl App {
         } else {
             Overlay::Help
         };
+        self.refresh_input_helper();
     }
 
     fn initial_queue_selection(&self) -> usize {
@@ -627,9 +733,22 @@ impl App {
         }
 
         if is_likely_youtube_url(&text) {
+            self.pending_youtube_import_input = Some(text.clone());
+            self.set_input_helper(
+                InputHelperKind::PendingYoutubeImport,
+                String::from("Resolving YouTube URL..."),
+                StatusLevel::Warning,
+                None,
+            );
             return AppAction::Command(CommandAction::ImportYoutubeUrl(text));
         }
 
+        self.set_input_helper(
+            InputHelperKind::PendingSearch,
+            String::from("Searching backend for candidates..."),
+            StatusLevel::Warning,
+            None,
+        );
         AppAction::Command(CommandAction::Search(text))
     }
 
@@ -709,6 +828,25 @@ impl App {
             };
             let _ = search;
             self.set_status(StatusLevel::Info, status_message);
+            let helper_message = if self
+                .search_overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.results.is_empty())
+            {
+                String::from("No matches found for this query.")
+            } else {
+                let count = self
+                    .search_overlay
+                    .as_ref()
+                    .map_or(0, |overlay| overlay.results.len());
+                format!("Found {count} candidate(s) • choose one in the center overlay")
+            };
+            self.set_input_helper(
+                InputHelperKind::Notice,
+                helper_message,
+                StatusLevel::Info,
+                Some(INPUT_HELPER_SUCCESS_TICKS),
+            );
         } else {
             self.pending_search_terminal =
                 Some((job_id, PendingSearchTerminalState::Completed(results)));
@@ -729,6 +867,12 @@ impl App {
             self.pending_search_terminal = None;
             self.pending_search_results_request = None;
             self.set_status(StatusLevel::Error, message);
+            self.set_input_helper(
+                InputHelperKind::Error,
+                self.status_message.clone(),
+                StatusLevel::Error,
+                None,
+            );
         } else {
             self.pending_search_terminal =
                 Some((job_id, PendingSearchTerminalState::Failed(message)));
@@ -824,17 +968,41 @@ impl App {
         match job.status {
             YoutubeImportJobStatus::Running => {
                 self.set_status(StatusLevel::Info, String::from("Resolving YouTube URL..."));
+                self.set_input_helper(
+                    InputHelperKind::PendingYoutubeImport,
+                    String::from("Resolving YouTube URL..."),
+                    StatusLevel::Warning,
+                    None,
+                );
             }
             YoutubeImportJobStatus::Completed => {
                 self.pending_youtube_import_job_id = None;
-                self.input.clear();
+                let completed_input = self.pending_youtube_import_input.take();
+                let should_replace_helper =
+                    self.should_show_pending_youtube_feedback(completed_input.as_deref());
+                if completed_input.is_none()
+                    || matches!(completed_input.as_deref(), Some(input) if self.input.text.trim() == input)
+                {
+                    self.input.clear();
+                }
                 self.set_status(
                     StatusLevel::Info,
                     String::from("Added YouTube video to queue."),
                 );
+                if should_replace_helper {
+                    self.set_input_helper(
+                        InputHelperKind::Notice,
+                        String::from("Added YouTube video to queue."),
+                        StatusLevel::Info,
+                        Some(INPUT_HELPER_SUCCESS_TICKS),
+                    );
+                } else {
+                    self.refresh_input_helper();
+                }
             }
             YoutubeImportJobStatus::Failed => {
                 self.pending_youtube_import_job_id = None;
+                let failed_input = self.pending_youtube_import_input.take();
                 self.set_status(
                     StatusLevel::Error,
                     job.error_message.unwrap_or_else(|| {
@@ -843,7 +1011,146 @@ impl App {
                         )
                     }),
                 );
+                if self.should_show_pending_youtube_feedback(failed_input.as_deref()) {
+                    self.set_input_helper(
+                        InputHelperKind::Error,
+                        self.status_message.clone(),
+                        StatusLevel::Error,
+                        None,
+                    );
+                } else {
+                    self.refresh_input_helper();
+                }
             }
+        }
+    }
+
+    fn clear_editable_input_helper(&mut self) {
+        if self.input_helper.as_ref().is_some_and(|helper| {
+            matches!(
+                helper.kind,
+                InputHelperKind::Notice | InputHelperKind::Error
+            )
+        }) {
+            self.input_helper = None;
+        }
+    }
+
+    fn set_input_helper(
+        &mut self,
+        kind: InputHelperKind,
+        message: String,
+        level: StatusLevel,
+        ttl_ticks: Option<u8>,
+    ) {
+        self.input_helper = Some(InputHelper {
+            kind,
+            message,
+            level,
+            ttl_ticks,
+        });
+    }
+
+    fn tick_input_helper(&mut self) {
+        let should_clear = if let Some(helper) = self.input_helper.as_mut() {
+            if let Some(ttl_ticks) = helper.ttl_ticks.as_mut() {
+                *ttl_ticks = ttl_ticks.saturating_sub(1);
+                *ttl_ticks == 0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if should_clear {
+            self.input_helper = None;
+            self.refresh_input_helper();
+        }
+    }
+
+    fn refresh_input_helper(&mut self) {
+        if self.visible_input_helper().is_none() {
+            self.input_helper = None;
+        }
+    }
+
+    fn should_show_pending_youtube_feedback(&self, submitted_input: Option<&str>) -> bool {
+        let trimmed = self.input.text.trim();
+        trimmed.is_empty() || matches!(submitted_input, Some(input) if trimmed == input)
+    }
+
+    fn visible_input_helper(&self) -> Option<&InputHelper> {
+        let helper = self.input_helper.as_ref()?;
+        if matches!(helper.kind, InputHelperKind::PendingSearch)
+            && self.overlay == Overlay::None
+            && self.pending_search_results_request.is_none()
+        {
+            return None;
+        }
+
+        if matches!(helper.kind, InputHelperKind::PendingYoutubeImport)
+            && !matches!(
+                self.pending_youtube_import_input.as_deref(),
+                Some(input) if self.input.text.trim() == input
+            )
+        {
+            return None;
+        }
+
+        Some(helper)
+    }
+
+    fn resolved_input_helper(&self) -> ResolvedInputHelper {
+        if let Some(helper) = self.visible_input_helper() {
+            return ResolvedInputHelper {
+                message: helper.message.clone(),
+                level: helper.level,
+                badge: match helper.kind {
+                    InputHelperKind::PendingSearch => Some("searching"),
+                    InputHelperKind::PendingYoutubeImport => Some("resolving"),
+                    InputHelperKind::Notice => Some("done"),
+                    InputHelperKind::Error => Some("error"),
+                },
+            };
+        }
+
+        let trimmed = self.input.text.trim();
+        if trimmed.is_empty() {
+            let message = if self.current_song.is_none() && self.queue.is_empty() {
+                String::from("Summon a song by name, artist, or a few remembered words.")
+            } else {
+                String::from(
+                    "Enter searches • paste a YouTube URL to add directly • /help shows commands",
+                )
+            };
+            return ResolvedInputHelper {
+                message,
+                level: StatusLevel::Info,
+                badge: None,
+            };
+        }
+
+        if trimmed.starts_with('/') {
+            return ResolvedInputHelper {
+                message: String::from("Press Enter to run this slash command."),
+                level: StatusLevel::Info,
+                badge: Some("command"),
+            };
+        }
+
+        if is_likely_youtube_url(trimmed) {
+            return ResolvedInputHelper {
+                message: String::from("YouTube URL detected • Enter adds it directly to the queue"),
+                level: StatusLevel::Info,
+                badge: Some("url"),
+            };
+        }
+
+        ResolvedInputHelper {
+            message: String::from("Press Enter to search the backend for candidates."),
+            level: StatusLevel::Info,
+            badge: None,
         }
     }
 
@@ -874,11 +1181,11 @@ impl App {
     fn render_now_playing_widget(&self, frame: &mut Frame<'_>, area: Rect) {
         let title = self.current_song.as_ref().map_or_else(
             || String::from("Nothing queued yet"),
-            |song| song.title.clone(),
+            |song| sanitize_display_text(&song.title),
         );
         let channel = self.current_song.as_ref().map_or_else(
             || String::from("Add a song from search once that flow is wired."),
-            |song| song.channel_name.clone(),
+            |song| sanitize_display_text(&song.channel_name),
         );
         let state_label = match self.playback.state {
             PlaybackStatus::Stopped => "Stopped",
@@ -987,25 +1294,42 @@ impl App {
 
     fn search_input_widget(&self) -> Paragraph<'static> {
         let (before_cursor, after_cursor) = self.input.split_for_render();
+        let helper = self.resolved_input_helper();
         let mut lines = vec![Line::from(vec![
             Span::styled("Query ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(before_cursor, Style::default().fg(Color::White)),
+            Span::styled(
+                sanitize_display_text(&before_cursor),
+                Style::default().fg(Color::White),
+            ),
             Span::styled("▏", Style::default().fg(Color::Rgb(132, 146, 166))),
-            Span::styled(after_cursor, Style::default().fg(Color::White)),
+            Span::styled(
+                sanitize_display_text(&after_cursor),
+                Style::default().fg(Color::White),
+            ),
         ])];
 
-        if self.current_song.is_none() && self.queue.is_empty() {
-            lines.push(Line::from(
-                "Summon a song by name, artist, or a few remembered words.",
-            ));
-        } else {
-            lines.push(Line::from(
-                "Enter searches • /help shows commands • results open in the center overlay",
+        lines.push(Line::from(Span::styled(
+            sanitize_display_text(&helper.message),
+            Style::default().fg(status_level_color(helper.level)),
+        )));
+
+        let mut title = vec![Span::styled(
+            "Search",
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        if let Some(badge) = helper.badge {
+            title.push(Span::styled(
+                format!(" • {badge}"),
+                Style::default().fg(status_level_color(helper.level)),
             ));
         }
 
         Paragraph::new(lines)
-            .block(Block::default().title("Search").borders(Borders::ALL))
+            .block(
+                Block::default()
+                    .title(Line::from(title))
+                    .borders(Borders::ALL),
+            )
             .wrap(Wrap { trim: true })
     }
 
@@ -1035,11 +1359,7 @@ impl App {
     }
 
     fn status_widget(&self) -> Paragraph<'static> {
-        let color = match self.status_level {
-            StatusLevel::Info => Color::Gray,
-            StatusLevel::Warning => Color::Yellow,
-            StatusLevel::Error => Color::LightRed,
-        };
+        let color = status_level_color(self.status_level);
         let version = self
             .backend
             .version
@@ -1057,12 +1377,19 @@ impl App {
         };
         let message = Line::from(vec![
             Span::styled("Backend ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("{} ({})", readiness, version)),
+            Span::raw(format!(
+                "{} ({})",
+                sanitize_display_text(readiness),
+                sanitize_display_text(&version)
+            )),
             Span::raw("  •  "),
             Span::styled("yt-dlp ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(yt_dlp_version),
+            Span::raw(sanitize_display_text(&yt_dlp_version)),
             Span::raw("  •  "),
-            Span::styled(self.status_message.clone(), Style::default().fg(color)),
+            Span::styled(
+                sanitize_display_text(&self.status_message),
+                Style::default().fg(color),
+            ),
         ]);
 
         Paragraph::new(vec![message])
@@ -1146,7 +1473,7 @@ impl App {
         let header = Paragraph::new(vec![
             Line::from(vec![
                 Span::styled("Search ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::raw(search.query.clone()),
+                Span::raw(sanitize_display_text(&search.query)),
             ]),
             Line::from(match search.state {
                 SearchOverlayState::Loading => "Looking up candidates on the backend...",
@@ -1182,7 +1509,7 @@ impl App {
                     .map(|(index, song)| {
                         let is_selected = index == search.selected;
                         let mut lines = vec![Line::from(vec![Span::styled(
-                            song.title.clone(),
+                            sanitize_display_text(&song.title),
                             if is_selected {
                                 Style::default()
                                     .fg(Color::White)
@@ -1194,7 +1521,7 @@ impl App {
                         if is_selected {
                             lines.push(Line::from(vec![
                                 Span::styled(
-                                    song.channel_name.clone(),
+                                    sanitize_display_text(&song.channel_name),
                                     Style::default().fg(Color::Gray),
                                 ),
                                 Span::raw(" • "),
@@ -1231,12 +1558,10 @@ impl App {
             }
             SearchOverlayState::Error => {
                 frame.render_widget(
-                    Paragraph::new(
-                        search
-                            .error_message
-                            .clone()
-                            .unwrap_or_else(|| String::from("Search failed.")),
-                    )
+                    Paragraph::new(search.error_message.clone().map_or_else(
+                        || String::from("Search failed."),
+                        |message| sanitize_display_text(&message),
+                    ))
                     .style(Style::default().fg(Color::LightRed))
                     .block(Block::default().borders(Borders::LEFT | Borders::RIGHT))
                     .wrap(Wrap { trim: true }),
@@ -1310,12 +1635,12 @@ impl App {
 
         Line::from(vec![
             Span::styled(format!("{} ", marker), style),
-            Span::styled(item.song.title.clone(), style),
+            Span::styled(sanitize_display_text(&item.song.title), style),
             Span::raw("  "),
             Span::styled(
                 format!(
                     "{} • {}",
-                    item.song.channel_name,
+                    sanitize_display_text(&item.song.channel_name),
                     format_duration(item.song.duration_ms)
                 ),
                 Style::default().fg(Color::Gray),
@@ -1325,7 +1650,7 @@ impl App {
 
     fn set_status(&mut self, level: StatusLevel, message: String) {
         self.status_level = level;
-        self.status_message = message;
+        self.status_message = sanitize_display_text(&message);
     }
 
     fn adjust_volume(&mut self, delta: i16) -> AppAction {
@@ -1506,6 +1831,41 @@ fn text_width(text: &str) -> u16 {
     text.chars().count().min(usize::from(u16::MAX)) as u16
 }
 
+fn status_level_color(level: StatusLevel) -> Color {
+    match level {
+        StatusLevel::Info => Color::Gray,
+        StatusLevel::Warning => Color::Yellow,
+        StatusLevel::Error => Color::LightRed,
+    }
+}
+
+fn sanitize_display_text(input: &str) -> String {
+    let mut sanitized = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+
+        if ch.is_control() {
+            sanitized.push(' ');
+        } else {
+            sanitized.push(ch);
+        }
+    }
+
+    sanitized
+}
+
 fn is_likely_youtube_url(input: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(input) else {
         return false;
@@ -1609,6 +1969,9 @@ mod tests {
                 "https://youtu.be/tuyZ9f6mHZk"
             )))
         );
+        let helper = app.resolved_input_helper();
+        assert_eq!(helper.message, "Resolving YouTube URL...");
+        assert_eq!(helper.badge, Some("resolving"));
     }
 
     #[test]
@@ -1714,6 +2077,12 @@ mod tests {
         assert_eq!(search.state, SearchOverlayState::Results);
         assert_eq!(search.results.len(), 1);
         assert_eq!(app.status_message, "Found 1 candidate(s).");
+        let helper = app.resolved_input_helper();
+        assert_eq!(
+            helper.message,
+            "Found 1 candidate(s) • choose one in the center overlay"
+        );
+        assert_eq!(helper.badge, Some("done"));
     }
 
     #[test]
@@ -1971,6 +2340,14 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_display_text_removes_ansi_sequences_and_controls() {
+        assert_eq!(
+            sanitize_display_text("oops\u{1b}[31mred\nnext\tline"),
+            "oopsred next line"
+        );
+    }
+
+    #[test]
     fn closed_search_does_not_reopen_when_results_arrive_late() {
         let mut app = App::new("127.0.0.1:4100".parse().unwrap());
         app.open_search_overlay(String::from("job_1"), String::from("late result"));
@@ -1996,6 +2373,7 @@ mod tests {
         assert_eq!(app.overlay, Overlay::None);
         assert!(app.search_overlay.is_none());
         assert!(app.input.text.is_empty());
+        assert!(app.input_helper.is_none());
     }
 
     #[test]
@@ -2008,6 +2386,9 @@ mod tests {
             job_id: String::from("youtube_import_job_1"),
         }));
         assert_eq!(app.status_message, "Resolving YouTube URL...");
+        let helper = app.resolved_input_helper();
+        assert_eq!(helper.message, "Resolving YouTube URL...");
+        assert_eq!(helper.badge, Some("resolving"));
 
         app.apply_backend_event(crate::backend::BackendEvent {
             event_id: String::from("evt_1"),
@@ -2036,6 +2417,86 @@ mod tests {
 
         assert!(app.input.text.is_empty());
         assert_eq!(app.status_message, "Added 'traveling' to queue.");
+        let helper = app.resolved_input_helper();
+        assert_eq!(helper.message, "Added 'traveling' to queue.");
+        assert_eq!(helper.badge, Some("done"));
+    }
+
+    #[test]
+    fn keyword_input_shows_search_guidance() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.input.text = String::from("utada traveling");
+        app.input.move_end();
+
+        let helper = app.resolved_input_helper();
+
+        assert_eq!(
+            helper.message,
+            "Press Enter to search the backend for candidates."
+        );
+        assert_eq!(helper.badge, None);
+    }
+
+    #[test]
+    fn success_helper_expires_back_to_default_guidance() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.set_input_helper(
+            InputHelperKind::Notice,
+            String::from("Added 'traveling' to queue."),
+            StatusLevel::Info,
+            Some(1),
+        );
+
+        app.tick();
+
+        let helper = app.resolved_input_helper();
+        assert_eq!(
+            helper.message,
+            "Summon a song by name, artist, or a few remembered words."
+        );
+        assert_eq!(helper.badge, None);
+    }
+
+    #[test]
+    fn editing_after_error_restores_contextual_guidance() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.set_input_helper(
+            InputHelperKind::Error,
+            String::from("Input is not a valid YouTube video URL."),
+            StatusLevel::Error,
+            None,
+        );
+        app.input.text = String::from("utada");
+        app.input.move_end();
+
+        let _ = app.handle_key(KeyEvent::from(KeyCode::Char(' ')));
+
+        let helper = app.resolved_input_helper();
+        assert_eq!(
+            helper.message,
+            "Press Enter to search the backend for candidates."
+        );
+    }
+
+    #[test]
+    fn pending_search_helper_hides_after_overlay_closes() {
+        let mut app = App::new("127.0.0.1:4100".parse().unwrap());
+        app.set_input_helper(
+            InputHelperKind::PendingSearch,
+            String::from("Searching backend for candidates..."),
+            StatusLevel::Warning,
+            None,
+        );
+        app.input.text = String::from("utada traveling");
+        app.input.move_end();
+
+        let helper = app.resolved_input_helper();
+
+        assert_eq!(
+            helper.message,
+            "Press Enter to search the backend for candidates."
+        );
+        assert_eq!(helper.badge, None);
     }
 
     #[test]
