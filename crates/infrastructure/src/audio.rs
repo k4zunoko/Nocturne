@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use nocturne_core::{PlaybackPort, PortError};
 use nocturne_domain::{AudioSettings, QueueItem};
+use rodio::cpal::traits::{DeviceTrait, HostTrait};
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
 use stream_download::process::{ProcessStreamParams, YtDlpCommand};
 use stream_download::storage::temp::TempStorageProvider;
@@ -20,6 +21,7 @@ use crate::yt_dlp::LocalYtDlpManager;
 const YT_DLP_AUDIO_FORMAT: &str = "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
 const YT_DLP_PROCESS_AUDIO_FORMAT: &str = "140/139";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const OUTPUT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PLAYBACK_URL_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const PLAYBACK_URL_CACHE_LIMIT: usize = 64;
 const PLAYBACK_STREAM_PREFETCH_BYTES: u64 = 64 * 1024;
@@ -64,6 +66,29 @@ pub enum PlaybackWorkerEvent {
         queue_item_id: String,
         code: String,
         message: String,
+    },
+    Interrupted {
+        playback_session_id: String,
+        queue_item_id: String,
+        code: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AudioOutputSignal {
+    StreamError {
+        playback_session_id: String,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlaybackRecoveryTrigger {
+    StreamError { message: String },
+    DefaultDeviceChanged {
+        previous_device_name: Option<String>,
+        current_device_name: Option<String>,
     },
 }
 
@@ -261,6 +286,9 @@ fn playback_worker_loop(
     let mut playback_runtime = None;
     let mut resolved_playback_urls = HashMap::new();
     let mut volume_percent = AudioSettings::DEFAULT_VOLUME_PERCENT;
+    let (audio_output_signal_tx, audio_output_signal_rx) = mpsc::channel();
+    let mut last_output_device_name = None;
+    let mut last_output_device_check_at = Instant::now();
 
     loop {
         match receiver.recv_timeout(WORKER_POLL_INTERVAL) {
@@ -280,7 +308,10 @@ fn playback_worker_loop(
                     playback_session_id,
                     position_ms,
                     volume_percent,
+                    &audio_output_signal_tx,
                 );
+                last_output_device_name = current_active_output_device_name(&active);
+                last_output_device_check_at = Instant::now();
             }
             Ok(WorkerCommand::SetVolume {
                 volume_percent: next_volume_percent,
@@ -305,7 +336,25 @@ fn playback_worker_loop(
                 clear_active_playback(&state, &mut active, false);
                 break;
             }
-            Err(RecvTimeoutError::Timeout) => poll_active_playback(&state, &mut active, &event_tx),
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(trigger) = detect_playback_recovery_trigger(
+                    &active,
+                    &audio_output_signal_rx,
+                    &mut last_output_device_name,
+                    &mut last_output_device_check_at,
+                ) {
+                    interrupt_active_playback(
+                        &state,
+                        &mut active,
+                        &event_tx,
+                        trigger,
+                    );
+                    last_output_device_name = current_active_output_device_name(&active);
+                    last_output_device_check_at = Instant::now();
+                }
+
+                poll_active_playback(&state, &mut active, &event_tx)
+            }
         }
     }
 }
@@ -321,6 +370,7 @@ fn handle_start(
     playback_session_id: String,
     position_ms: u64,
     volume_percent: u8,
+    audio_output_signal_tx: &Sender<AudioOutputSignal>,
 ) {
     clear_active_playback(state, active, false);
     let load_started_at = Instant::now();
@@ -342,6 +392,7 @@ fn handle_start(
             resolved_playback_urls,
             yt_dlp,
             volume_percent,
+            audio_output_signal_tx,
         ) {
             Ok(active_playback) => active_playback,
             Err(error) => {
@@ -600,11 +651,7 @@ fn clear_active_playback(
     active: &mut Option<ActivePlayback>,
     record_stop: bool,
 ) {
-    if let Some(active_playback) = active.take()
-        && let ActivePlayback::Rodio { player, .. } = active_playback
-    {
-        player.stop();
-    }
+    drop_active_output(active);
 
     let mut snapshot = recover_lock(&state.inner);
     snapshot.current_item = None;
@@ -613,6 +660,14 @@ fn clear_active_playback(
     snapshot.paused = false;
     if record_stop {
         snapshot.history.push(PlaybackCommand::Stop);
+    }
+}
+
+fn drop_active_output(active: &mut Option<ActivePlayback>) {
+    if let Some(active_playback) = active.take()
+        && let ActivePlayback::Rodio { player, .. } = active_playback
+    {
+        player.stop();
     }
 }
 
@@ -630,14 +685,10 @@ fn open_real_playback(
     resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
     yt_dlp: &LocalYtDlpManager,
     volume_percent: u8,
+    audio_output_signal_tx: &Sender<AudioOutputSignal>,
 ) -> Result<ActivePlayback, PortError> {
     let audio_output_started_at = Instant::now();
-    let sink = DeviceSinkBuilder::open_default_sink().map_err(|error| {
-        PortError::new(
-            "audio_output_unavailable",
-            format!("failed to open the default audio output device: {error}"),
-        )
-    })?;
+    let sink = open_default_output_sink(playback_session_id, audio_output_signal_tx)?;
     let audio_output_elapsed_ms = audio_output_started_at.elapsed().as_millis();
 
     let player_started_at = Instant::now();
@@ -750,6 +801,188 @@ fn open_real_playback(
         _sink: sink,
         player,
     })
+}
+
+fn open_default_output_sink(
+    playback_session_id: &str,
+    audio_output_signal_tx: &Sender<AudioOutputSignal>,
+) -> Result<MixerDeviceSink, PortError> {
+    let error_signal_tx = audio_output_signal_tx.clone();
+    let playback_session_id = playback_session_id.to_owned();
+    DeviceSinkBuilder::from_default_device()
+        .map_err(|error| {
+            PortError::new(
+                "audio_output_unavailable",
+                format!("failed to open the default audio output device: {error}"),
+            )
+        })?
+        .with_error_callback(move |error| {
+            let _ = error_signal_tx.send(AudioOutputSignal::StreamError {
+                playback_session_id: playback_session_id.clone(),
+                message: error.to_string(),
+            });
+        })
+        .open_stream()
+        .map_err(|error| {
+            PortError::new(
+                "audio_output_unavailable",
+                format!("failed to open the default audio output device: {error}"),
+            )
+        })
+}
+
+fn detect_playback_recovery_trigger(
+    active: &Option<ActivePlayback>,
+    audio_output_signal_rx: &Receiver<AudioOutputSignal>,
+    last_output_device_name: &mut Option<String>,
+    last_output_device_check_at: &mut Instant,
+) -> Option<PlaybackRecoveryTrigger> {
+    if !matches!(active, Some(ActivePlayback::Rodio { .. })) {
+        return None;
+    }
+
+    let stream_error = consume_audio_output_signal(
+        audio_output_signal_rx,
+        active_playback_session_id(active.as_ref()),
+    );
+
+    if stream_error.is_some() {
+        return stream_error;
+    }
+
+    if last_output_device_check_at.elapsed() < OUTPUT_DEVICE_POLL_INTERVAL {
+        return None;
+    }
+
+    *last_output_device_check_at = Instant::now();
+    let current_device_name = current_default_output_device_name();
+    if default_output_device_changed(last_output_device_name.as_deref(), current_device_name.as_deref()) {
+        let trigger = PlaybackRecoveryTrigger::DefaultDeviceChanged {
+            previous_device_name: last_output_device_name.clone(),
+            current_device_name: current_device_name.clone(),
+        };
+        *last_output_device_name = current_device_name;
+        return Some(trigger);
+    }
+
+    *last_output_device_name = current_device_name;
+    None
+}
+
+fn consume_audio_output_signal(
+    audio_output_signal_rx: &Receiver<AudioOutputSignal>,
+    active_playback_session_id: Option<&str>,
+) -> Option<PlaybackRecoveryTrigger> {
+    let mut stream_error = None;
+
+    while let Ok(signal) = audio_output_signal_rx.try_recv() {
+        match signal {
+            AudioOutputSignal::StreamError {
+                playback_session_id,
+                message,
+            } if Some(playback_session_id.as_str()) == active_playback_session_id => {
+                stream_error = Some(PlaybackRecoveryTrigger::StreamError { message });
+            }
+            AudioOutputSignal::StreamError { .. } => {}
+        }
+    }
+
+    stream_error
+}
+
+fn interrupt_active_playback(
+    state: &SharedPlaybackState,
+    active: &mut Option<ActivePlayback>,
+    event_tx: &UnboundedSender<PlaybackWorkerEvent>,
+    trigger: PlaybackRecoveryTrigger,
+) {
+    let Some((playback_session_id, queue_item_id)) = active_playback_ids(active.as_ref()) else {
+        return;
+    };
+    eprintln!(
+        "[nocturne][playback] interrupted queue_item_id={} session_id={} reason={}",
+        queue_item_id,
+        playback_session_id,
+        playback_recovery_reason(&trigger),
+    );
+    clear_active_playback(state, active, false);
+    let _ = event_tx.send(PlaybackWorkerEvent::Interrupted {
+        playback_session_id,
+        queue_item_id,
+        code: interruption_code(&trigger).to_owned(),
+        message: playback_recovery_reason(&trigger),
+    });
+}
+
+fn interruption_code(trigger: &PlaybackRecoveryTrigger) -> &'static str {
+    match trigger {
+        PlaybackRecoveryTrigger::StreamError { .. } => "audio_output_stream_lost",
+        PlaybackRecoveryTrigger::DefaultDeviceChanged { .. } => "audio_output_changed",
+    }
+}
+
+fn active_playback_session_id(active: Option<&ActivePlayback>) -> Option<&str> {
+    match active {
+        Some(ActivePlayback::Simulated {
+            playback_session_id,
+            ..
+        })
+        | Some(ActivePlayback::Rodio {
+            playback_session_id,
+            ..
+        }) => Some(playback_session_id.as_str()),
+        None => None,
+    }
+}
+
+fn active_playback_ids(active: Option<&ActivePlayback>) -> Option<(String, String)> {
+    match active {
+        Some(ActivePlayback::Rodio {
+            playback_session_id,
+            queue_item_id,
+            ..
+        }) => Some((playback_session_id.clone(), queue_item_id.clone())),
+        _ => None,
+    }
+}
+
+fn playback_recovery_reason(trigger: &PlaybackRecoveryTrigger) -> String {
+    match trigger {
+        PlaybackRecoveryTrigger::StreamError { message } => {
+            format!("stream error: {message}")
+        }
+        PlaybackRecoveryTrigger::DefaultDeviceChanged {
+            previous_device_name,
+            current_device_name,
+        } => format!(
+            "default output device changed: {} -> {}",
+            previous_device_name.as_deref().unwrap_or("<none>"),
+            current_device_name.as_deref().unwrap_or("<none>")
+        ),
+    }
+}
+
+fn current_active_output_device_name(active: &Option<ActivePlayback>) -> Option<String> {
+    if matches!(active, Some(ActivePlayback::Rodio { .. })) {
+        current_default_output_device_name()
+    } else {
+        None
+    }
+}
+
+fn current_default_output_device_name() -> Option<String> {
+    rodio::cpal::default_host()
+        .default_output_device()
+        .and_then(|device| {
+            device
+                .description()
+                .ok()
+                .map(|description| description.name().to_owned())
+        })
+}
+
+fn default_output_device_changed(previous: Option<&str>, current: Option<&str>) -> bool {
+    previous != current
 }
 
 fn playback_runtime_instance(
@@ -1235,6 +1468,74 @@ mod tests {
 
         assert_eq!(preferences.format_hint, None);
         assert_eq!(preferences.mime_type, Some("audio/mp4"));
+    }
+
+    #[test]
+    fn default_output_device_change_detection_requires_actual_change() {
+        assert!(!default_output_device_changed(Some("Speakers"), Some("Speakers")));
+        assert!(default_output_device_changed(
+            Some("Speakers"),
+            Some("Headphones")
+        ));
+        assert!(default_output_device_changed(Some("Speakers"), None));
+    }
+
+    #[test]
+    fn stale_audio_output_signals_are_ignored_for_new_sessions() {
+        let (signal_tx, signal_rx) = mpsc::channel();
+        signal_tx
+            .send(AudioOutputSignal::StreamError {
+                playback_session_id: String::from("playback_session_old"),
+                message: String::from("stale device error"),
+            })
+            .unwrap();
+
+        let trigger = consume_audio_output_signal(&signal_rx, Some("playback_session_new"));
+
+        assert_eq!(trigger, None);
+    }
+
+    #[test]
+    fn current_session_audio_output_signal_is_consumed() {
+        let (signal_tx, signal_rx) = mpsc::channel();
+        signal_tx
+            .send(AudioOutputSignal::StreamError {
+                playback_session_id: String::from("playback_session_old"),
+                message: String::from("stale device error"),
+            })
+            .unwrap();
+        signal_tx
+            .send(AudioOutputSignal::StreamError {
+                playback_session_id: String::from("playback_session_current"),
+                message: String::from("current device error"),
+            })
+            .unwrap();
+
+        let trigger = consume_audio_output_signal(&signal_rx, Some("playback_session_current"));
+
+        assert_eq!(
+            trigger,
+            Some(PlaybackRecoveryTrigger::StreamError {
+                message: String::from("current device error"),
+            })
+        );
+    }
+
+    #[test]
+    fn interruption_code_reflects_recovery_trigger() {
+        assert_eq!(
+            interruption_code(&PlaybackRecoveryTrigger::StreamError {
+                message: String::from("stream broke"),
+            }),
+            "audio_output_stream_lost"
+        );
+        assert_eq!(
+            interruption_code(&PlaybackRecoveryTrigger::DefaultDeviceChanged {
+                previous_device_name: Some(String::from("Speakers")),
+                current_device_name: Some(String::from("Headphones")),
+            }),
+            "audio_output_changed"
+        );
     }
 
     #[test]
