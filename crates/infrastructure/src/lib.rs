@@ -18,7 +18,7 @@ pub use events::{BroadcastEventPublisher, EventCursorError, LocalEventLog, Local
 pub use ids::LocalIdGenerator;
 pub use search::{
     LocalSearchAdapter, LocalSearchFailure, LocalSearchRuntime, PendingSearchJob,
-    PendingYoutubeImportJob, canonicalize_supported_youtube_url,
+    PendingYoutubeImportJob, YoutubeImportResolution, canonicalize_supported_youtube_url,
 };
 pub use settings::LocalAudioSettingsStore;
 pub use yt_dlp::{

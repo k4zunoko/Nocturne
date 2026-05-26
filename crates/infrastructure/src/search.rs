@@ -31,6 +31,14 @@ pub struct LocalSearchFailure {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YoutubeImportResolution {
+    pub canonical_url: String,
+    pub songs: Vec<Song>,
+    pub total_count: u64,
+    pub failed_count: u64,
+}
+
 #[derive(Debug, Clone)]
 struct LocalSearchState {
     pending: VecDeque<PendingSearchJob>,
@@ -126,7 +134,7 @@ impl LocalSearchRuntime {
         search_with_yt_dlp(query, &yt_dlp)
     }
 
-    pub fn resolve_youtube_url(&self, url: &str) -> Result<Song, LocalSearchFailure> {
+    pub fn resolve_youtube_url(&self, url: &str) -> Result<YoutubeImportResolution, LocalSearchFailure> {
         let url = url.trim();
         let normalized_url = normalize_query(url);
         let yt_dlp = {
@@ -136,10 +144,13 @@ impl LocalSearchRuntime {
                 return Err(failure.clone());
             }
 
-            if let Some(results) = state.fixtures.get(&normalized_url)
-                && let Some(song) = results.first()
-            {
-                return Ok(song.clone());
+            if let Some(results) = state.fixtures.get(&normalized_url) {
+                return Ok(YoutubeImportResolution {
+                    canonical_url: url.to_owned(),
+                    total_count: u64::try_from(results.len()).unwrap_or(u64::MAX),
+                    failed_count: 0,
+                    songs: results.clone(),
+                });
             }
 
             state.yt_dlp.clone()
@@ -224,7 +235,7 @@ fn search_with_yt_dlp(
 fn resolve_youtube_url_with_yt_dlp(
     url: &str,
     yt_dlp: &LocalYtDlpManager,
-) -> Result<Song, LocalSearchFailure> {
+) -> Result<YoutubeImportResolution, LocalSearchFailure> {
     let resolved = parse_supported_youtube_url(url)?;
     let output = yt_dlp
         .execute([
@@ -247,7 +258,7 @@ fn resolve_youtube_url_with_yt_dlp(
         });
     }
 
-    parse_yt_dlp_video_output(&output.stdout)
+    parse_yt_dlp_youtube_output(&output.stdout, &resolved.canonical_url)
 }
 
 fn map_search_spawn_error(error: std::io::Error) -> LocalSearchFailure {
@@ -298,13 +309,48 @@ fn parse_yt_dlp_search_output(payload: &[u8]) -> Result<Vec<Song>, LocalSearchFa
     Ok(results)
 }
 
-fn parse_yt_dlp_video_output(payload: &[u8]) -> Result<Song, LocalSearchFailure> {
+fn parse_yt_dlp_youtube_output(
+    payload: &[u8],
+    canonical_url: &str,
+) -> Result<YoutubeImportResolution, LocalSearchFailure> {
     let root: Value = serde_json::from_slice(payload).map_err(|_error| LocalSearchFailure {
         code: String::from("yt_dlp_invalid_json"),
         message: String::from("Search provider returned unreadable data."),
     })?;
 
-    song_from_yt_dlp_video(&root)
+    if let Some(entries) = root.get("entries").and_then(Value::as_array) {
+        let playlist_count = root
+            .get("playlist_count")
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| u64::try_from(entries.len()).unwrap_or(u64::MAX));
+        let songs = entries
+            .iter()
+            .filter_map(|entry| song_from_yt_dlp_entry(entry).ok())
+            .collect::<Vec<_>>();
+        let queued_count = u64::try_from(songs.len()).unwrap_or(u64::MAX);
+        let failed_count = playlist_count.saturating_sub(queued_count);
+
+        if songs.is_empty() {
+            return Err(LocalSearchFailure {
+                code: String::from("yt_dlp_failed"),
+                message: String::from("The backend failed to resolve this YouTube playlist."),
+            });
+        }
+
+        return Ok(YoutubeImportResolution {
+            canonical_url: canonical_url.to_owned(),
+            songs,
+            total_count: playlist_count,
+            failed_count,
+        });
+    }
+
+    Ok(YoutubeImportResolution {
+        canonical_url: canonical_url.to_owned(),
+        songs: vec![song_from_yt_dlp_video(&root)?],
+        total_count: 1,
+        failed_count: 0,
+    })
 }
 
 fn song_from_yt_dlp_entry(entry: &Value) -> Result<Song, LocalSearchFailure> {
@@ -400,56 +446,68 @@ pub fn canonicalize_supported_youtube_url(url: &str) -> Result<String, LocalSear
 fn parse_supported_youtube_url(url: &str) -> Result<ResolvedYoutubeVideoUrl, LocalSearchFailure> {
     let parsed = reqwest::Url::parse(url).map_err(|_| LocalSearchFailure {
         code: String::from("youtube_url_invalid"),
-        message: String::from("Input is not a valid YouTube video URL."),
+        message: String::from("Input is not a valid YouTube URL."),
     })?;
 
     let Some(host) = parsed.host_str().map(|host| host.to_ascii_lowercase()) else {
         return Err(LocalSearchFailure {
             code: String::from("youtube_url_invalid"),
-            message: String::from("Input is not a valid YouTube video URL."),
+            message: String::from("Input is not a valid YouTube URL."),
         });
     };
 
-    let video_id = if host == YOUTU_BE_HOST {
+    let canonical_url = if host == YOUTU_BE_HOST {
         let video_id = parsed.path().trim_start_matches('/');
         if !valid_video_id(video_id) {
             return Err(LocalSearchFailure {
                 code: String::from("youtube_url_invalid"),
-                message: String::from("Input is not a valid YouTube video URL."),
+                message: String::from("Input is not a valid YouTube URL."),
             });
         }
-        video_id.to_owned()
+        canonical_youtube_watch_url(video_id)
     } else if matches!(host.as_str(), "youtube.com" | "www.youtube.com") {
-        if parsed.path() != YOUTUBE_WATCH_PATH {
-            return Err(LocalSearchFailure {
-                code: String::from("youtube_url_unsupported"),
-                message: String::from("This YouTube URL format is not supported yet."),
-            });
-        }
+        if parsed.path() == "/playlist" {
+            let playlist_id = parsed
+                .query_pairs()
+                .find_map(|(key, value)| (key == "list").then_some(value.into_owned()))
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| LocalSearchFailure {
+                    code: String::from("youtube_url_invalid"),
+                    message: String::from("Input is not a valid YouTube URL."),
+                })?;
+            format!("https://{YOUTUBE_CANONICAL_HOST}/playlist?list={playlist_id}")
+        } else {
+            if parsed.path() != YOUTUBE_WATCH_PATH {
+                return Err(LocalSearchFailure {
+                    code: String::from("youtube_url_unsupported"),
+                    message: String::from("This YouTube URL format is not supported yet."),
+                });
+            }
 
-        let video = parsed
-            .query_pairs()
-            .find_map(|(key, value)| (key == "v").then_some(value.into_owned()))
-            .ok_or_else(|| LocalSearchFailure {
-                code: String::from("youtube_url_invalid"),
-                message: String::from("Input is not a valid YouTube video URL."),
-            })?;
-        if !valid_video_id(&video) {
-            return Err(LocalSearchFailure {
-                code: String::from("youtube_url_invalid"),
-                message: String::from("Input is not a valid YouTube video URL."),
-            });
+            let video = parsed
+                .query_pairs()
+                .find_map(|(key, value)| (key == "v").then_some(value.into_owned()))
+                .ok_or_else(|| LocalSearchFailure {
+                    code: String::from("youtube_url_invalid"),
+                    message: String::from("Input is not a valid YouTube URL."),
+                })?;
+            if !valid_video_id(&video) {
+                return Err(LocalSearchFailure {
+                    code: String::from("youtube_url_invalid"),
+                    message: String::from("Input is not a valid YouTube URL."),
+                });
+            }
+            canonical_youtube_watch_url(&video)
         }
-        video
     } else {
         return Err(LocalSearchFailure {
             code: String::from("youtube_url_invalid"),
-            message: String::from("Input is not a valid YouTube video URL."),
+            message: String::from("Input is not a valid YouTube URL."),
         });
     };
 
     Ok(ResolvedYoutubeVideoUrl {
-        canonical_url: canonical_youtube_watch_url(&video_id),
+        canonical_url,
     })
 }
 
@@ -582,15 +640,21 @@ mod tests {
             "duration": 295.0
         }"#;
 
-        let result = parse_yt_dlp_video_output(payload).unwrap();
+        let result = parse_yt_dlp_youtube_output(
+            payload,
+            "https://www.youtube.com/watch?v=tuyZ9f6mHZk",
+        )
+        .unwrap();
 
-        assert_eq!(result.id, "youtube:tuyZ9f6mHZk");
-        assert_eq!(result.channel_name, "Hikaru Utada");
-        assert_eq!(result.duration_ms, 295_000);
+        assert_eq!(result.songs[0].id, "youtube:tuyZ9f6mHZk");
+        assert_eq!(result.songs[0].channel_name, "Hikaru Utada");
+        assert_eq!(result.songs[0].duration_ms, 295_000);
         assert_eq!(
-            result.source_url,
+            result.songs[0].source_url,
             "https://www.youtube.com/watch?v=tuyZ9f6mHZk"
         );
+        assert_eq!(result.total_count, 1);
+        assert_eq!(result.failed_count, 0);
     }
 
     #[test]
@@ -626,10 +690,12 @@ mod tests {
             "https://www.youtube.com/watch?v=tuyZ9f6mHZk"
         );
 
-        let playlist_error =
+        assert_eq!(
             parse_supported_youtube_url("https://www.youtube.com/playlist?list=PL1234567890")
-                .unwrap_err();
-        assert_eq!(playlist_error.code, "youtube_url_unsupported");
+                .unwrap()
+                .canonical_url,
+            "https://www.youtube.com/playlist?list=PL1234567890"
+        );
 
         let shorts_error =
             parse_supported_youtube_url("https://www.youtube.com/shorts/tuyZ9f6mHZk").unwrap_err();
