@@ -277,12 +277,12 @@ impl App {
                 }
                 self.set_status(
                     StatusLevel::Info,
-                    format!("Added '{}' to queue.", payload.song.title),
+                    Self::youtube_import_success_message(&payload.job),
                 );
                 if should_replace_helper {
                     self.set_input_helper(
                         InputHelperKind::Notice,
-                        format!("Added '{}' to queue.", payload.song.title),
+                        self.status_message.clone(),
                         StatusLevel::Info,
                         Some(INPUT_HELPER_SUCCESS_TICKS),
                     );
@@ -987,12 +987,12 @@ impl App {
                 }
                 self.set_status(
                     StatusLevel::Info,
-                    String::from("Added YouTube video to queue."),
+                    Self::youtube_import_success_message(&job),
                 );
                 if should_replace_helper {
                     self.set_input_helper(
                         InputHelperKind::Notice,
-                        String::from("Added YouTube video to queue."),
+                        self.status_message.clone(),
                         StatusLevel::Info,
                         Some(INPUT_HELPER_SUCCESS_TICKS),
                     );
@@ -1049,6 +1049,14 @@ impl App {
             level,
             ttl_ticks,
         });
+    }
+
+    fn youtube_import_success_message(job: &YoutubeImportJobSummary) -> String {
+        match (job.queued_count, job.failed_count) {
+            (1, 0) => String::from("Added 1 item to queue."),
+            (queued, 0) => format!("Added {queued} items to queue."),
+            (queued, failed) => format!("Added {queued} items to queue. {failed} items failed."),
+        }
     }
 
     fn tick_input_helper(&mut self) {
@@ -2398,27 +2406,22 @@ mod tests {
                         job_id: String::from("youtube_import_job_1"),
                         status: nocturne_api::YoutubeImportJobStatus::Completed,
                         url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+                        total_count: 1,
+                        queued_count: 1,
+                        failed_count: 0,
                         created_at: String::from("2026-04-24T00:00:00Z"),
                         completed_at: Some(String::from("2026-04-24T00:00:02Z")),
                         error_code: None,
                         error_message: None,
                     },
-                    song: Song {
-                        id: String::from("youtube:tuyZ9f6mHZk"),
-                        title: String::from("traveling"),
-                        channel_name: String::from("Hikaru Utada"),
-                        duration_ms: 295_000,
-                        source_url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
-                    },
-                    queue_item_id: String::from("queue_item_1"),
                 },
             ),
         });
 
         assert!(app.input.text.is_empty());
-        assert_eq!(app.status_message, "Added 'traveling' to queue.");
+        assert_eq!(app.status_message, "Added 1 item to queue.");
         let helper = app.resolved_input_helper();
-        assert_eq!(helper.message, "Added 'traveling' to queue.");
+        assert_eq!(helper.message, "Added 1 item to queue.");
         assert_eq!(helper.badge, Some("done"));
     }
 
@@ -2442,7 +2445,7 @@ mod tests {
         let mut app = App::new("127.0.0.1:4100".parse().unwrap());
         app.set_input_helper(
             InputHelperKind::Notice,
-            String::from("Added 'traveling' to queue."),
+            String::from("Added 1 item to queue."),
             StatusLevel::Info,
             Some(1),
         );
@@ -2462,7 +2465,7 @@ mod tests {
         let mut app = App::new("127.0.0.1:4100".parse().unwrap());
         app.set_input_helper(
             InputHelperKind::Error,
-            String::from("Input is not a valid YouTube video URL."),
+            String::from("Input is not a valid YouTube URL."),
             StatusLevel::Error,
             None,
         );
@@ -2527,6 +2530,9 @@ mod tests {
                     job_id: String::from("youtube_import_job_1"),
                     status: YoutubeImportJobStatus::Completed,
                     url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+                    total_count: 1,
+                    queued_count: 1,
+                    failed_count: 0,
                     created_at: String::from("2026-04-24T00:00:00Z"),
                     completed_at: Some(String::from("2026-04-24T00:00:02Z")),
                     error_code: None,
@@ -2540,7 +2546,7 @@ mod tests {
         );
 
         assert!(app.input.text.is_empty());
-        assert_eq!(app.status_message, "Added YouTube video to queue.");
+        assert_eq!(app.status_message, "Added 1 item to queue.");
         assert!(app.pending_youtube_import_job_id.is_none());
     }
 
@@ -2571,10 +2577,13 @@ mod tests {
                     job_id: String::from("youtube_import_job_1"),
                     status: YoutubeImportJobStatus::Failed,
                     url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
+                    total_count: 0,
+                    queued_count: 0,
+                    failed_count: 0,
                     created_at: String::from("2026-04-24T00:00:00Z"),
                     completed_at: Some(String::from("2026-04-24T00:00:02Z")),
                     error_code: Some(String::from("youtube_url_invalid")),
-                    error_message: Some(String::from("Input is not a valid YouTube video URL.")),
+                    error_message: Some(String::from("Input is not a valid YouTube URL.")),
                 }],
                 revision: 1,
                 snapshot_id: String::from("snap_1"),
@@ -2585,7 +2594,7 @@ mod tests {
 
         assert_eq!(
             app.status_message,
-            "Input is not a valid YouTube video URL."
+            "Input is not a valid YouTube URL."
         );
         assert!(app.pending_youtube_import_job_id.is_none());
     }

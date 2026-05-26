@@ -70,6 +70,9 @@ pub struct YoutubeImportJobSummary {
     pub job_id: Id,
     pub status: YoutubeImportJobStatus,
     pub url: String,
+    pub total_count: u64,
+    pub queued_count: u64,
+    pub failed_count: u64,
     pub created_at: Timestamp,
     pub completed_at: Option<Timestamp>,
     pub error_code: Option<String>,
@@ -234,8 +237,6 @@ pub struct SearchJobFailed {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct YoutubeImportCompleted {
     pub job: YoutubeImportJobSummary,
-    pub song: Song,
-    pub queue_item_id: Id,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

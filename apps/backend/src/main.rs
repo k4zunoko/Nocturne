@@ -35,7 +35,7 @@ use nocturne_infrastructure::{
     BroadcastEventPublisher, EventCursorError, InfrastructureProfile, LocalAudioSettingsStore,
     LocalClock, LocalEventLog, LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter,
     LocalSearchRuntime, LocalYtDlpManager, LocalYtDlpSettingsStore, PlaybackWorkerEvent,
-    SharedPlaybackState, canonicalize_supported_youtube_url,
+    SharedPlaybackState, YoutubeImportResolution, canonicalize_supported_youtube_url,
 };
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -385,8 +385,15 @@ async fn process_pending_youtube_import_jobs(
 
         let mut orchestrator = orchestrator.lock().await;
         match result {
-            Ok(Ok(song)) => {
-                if let Err(error) = orchestrator.complete_youtube_import(&job.job_id, song) {
+            Ok(Ok(YoutubeImportResolution {
+                songs,
+                total_count,
+                failed_count,
+                ..
+            })) => {
+                if let Err(error) =
+                    orchestrator.complete_youtube_import(&job.job_id, songs, total_count, failed_count)
+                {
                     let code = core_error_code(&error).to_owned();
                     let user_message = user_message_for_youtube_import_completion_error(&error);
                     let should_emit_system_error = matches!(
@@ -483,15 +490,18 @@ fn user_message_for_search_failure(code: &str) -> &'static str {
 
 fn user_message_for_youtube_import_failure(code: &str) -> &'static str {
     match code {
-        "youtube_url_invalid" => "Input is not a valid YouTube video URL.",
+        "youtube_url_invalid" => "Input is not a valid YouTube URL.",
         "youtube_url_unsupported" => "This YouTube URL format is not supported yet.",
         "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
         "yt_dlp_spawn_failed" => "The backend could not start YouTube URL resolution.",
         "yt_dlp_timeout" => "YouTube URL resolution timed out.",
         "yt_dlp_invalid_json" | "yt_dlp_invalid_response" => {
-            "The backend could not read metadata for this YouTube video."
+            "The backend could not read metadata for this YouTube URL."
         }
-        "yt_dlp_failed" => "The backend failed to resolve this YouTube video.",
+        "yt_dlp_failed" => "The backend failed to resolve this YouTube URL.",
+        "youtube_import_empty" => {
+            "The backend did not find any playable videos for this YouTube URL."
+        }
         _ => "YouTube URL import failed on the backend.",
     }
 }
@@ -1101,8 +1111,6 @@ fn map_server_event(core: CoreEvent) -> (EventName, Value) {
             EventName::YoutubeImportCompleted,
             serde_json::to_value(YoutubeImportCompleted {
                 job: map_youtube_import_job_summary(event.job),
-                song: event.song,
-                queue_item_id: event.queue_item_id,
             })
             .expect("youtube import completed event should serialize"),
         ),
@@ -1165,6 +1173,9 @@ fn map_youtube_import_job_summary(job: YoutubeImportJobRecord) -> YoutubeImportJ
         job_id: job.job_id,
         status: map_youtube_import_job_status(job.status),
         url: job.url,
+        total_count: job.total_count,
+        queued_count: job.queued_count,
+        failed_count: job.failed_count,
         created_at: job.created_at,
         completed_at: job.completed_at,
         error_code: job.error_code,
