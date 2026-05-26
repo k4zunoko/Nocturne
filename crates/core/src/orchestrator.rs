@@ -119,6 +119,12 @@ pub struct Orchestrator<C, I, E, P, S> {
     state: OrchestratorState,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YoutubeImportCompletion {
+    pub queued_count: u64,
+    pub failed_count: u64,
+}
+
 impl<C, I, E, P, S> Orchestrator<C, I, E, P, S>
 where
     C: ClockPort,
@@ -288,6 +294,9 @@ where
             job_id: job_id.clone(),
             status: YoutubeImportJobStatus::Running,
             url: url.to_owned(),
+            total_count: 0,
+            queued_count: 0,
+            failed_count: 0,
             created_at: self.clock.now(),
             completed_at: None,
             error_code: None,
@@ -365,11 +374,25 @@ where
     pub fn complete_youtube_import(
         &mut self,
         job_id: &str,
-        song: Song,
-    ) -> Result<CommandReceipt, CoreError> {
+        songs: Vec<Song>,
+        total_count: u64,
+        failed_count: u64,
+    ) -> Result<YoutubeImportCompletion, CoreError> {
+        {
+            let job = self.find_youtube_import_job_mut(job_id)?;
+            if job.status != YoutubeImportJobStatus::Running {
+                return Err(CoreError::conflict(
+                    "youtube_import_job_not_running",
+                    "cannot complete a YouTube import job that is no longer running",
+                ));
+            }
+        }
+
         let queue_len_before = self.state.queue.len();
-        let receipt = match self.enqueue_song(song.clone()) {
-            Ok(receipt) => receipt,
+        let queued_count = u64::try_from(songs.len())
+            .map_err(|_| CoreError::conflict("queue_item_count_overflow", "queue item count exceeds u64"))?;
+        match self.enqueue_songs(songs) {
+            Ok(()) => {}
             Err(error) => {
                 if self.state.queue.len() > queue_len_before {
                     self.state.queue.truncate(queue_len_before);
@@ -383,23 +406,14 @@ where
                 return Err(error);
             }
         };
-        let queue_item_id = receipt.queue_item_id.clone().ok_or_else(|| {
-            CoreError::conflict(
-                "queue_item_id_missing",
-                "queue item id was missing after enqueueing imported song",
-            )
-        })?;
 
         let completed_at = self.clock.now();
         let job = {
             let job = self.find_youtube_import_job_mut(job_id)?;
-            if job.status != YoutubeImportJobStatus::Running {
-                return Err(CoreError::conflict(
-                    "youtube_import_job_not_running",
-                    "cannot complete a YouTube import job that is no longer running",
-                ));
-            }
             job.status = YoutubeImportJobStatus::Completed;
+            job.total_count = total_count;
+            job.queued_count = queued_count;
+            job.failed_count = failed_count;
             job.completed_at = Some(completed_at);
             job.error_code = None;
             job.error_message = None;
@@ -410,12 +424,13 @@ where
             CoreEventKind::YoutubeImportCompleted,
             CoreEvent::YoutubeImportCompleted(YoutubeImportCompletedEvent {
                 job,
-                song,
-                queue_item_id,
             }),
         )?;
 
-        Ok(receipt)
+        Ok(YoutubeImportCompletion {
+            queued_count,
+            failed_count,
+        })
     }
 
     pub fn fail_youtube_import(
@@ -462,12 +477,7 @@ where
     }
 
     pub fn enqueue_song(&mut self, song: Song) -> Result<CommandReceipt, CoreError> {
-        let item = QueueItem {
-            id: self.ids.next_id(IdKind::QueueItem),
-            song,
-            added_at: self.clock.now(),
-            status: QueueItemStatus::Queued,
-        };
+        let item = self.new_queue_item(song);
         let queue_item_id = item.id.clone();
         self.state.queue.push(item);
         self.publish_state_updated()?;
@@ -477,6 +487,40 @@ where
         }
 
         self.command_accepted(None, Some(queue_item_id))
+    }
+
+    fn enqueue_songs(&mut self, songs: Vec<Song>) -> Result<(), CoreError> {
+        if songs.is_empty() {
+            return Err(CoreError::validation(
+                "youtube_import_empty",
+                "YouTube import did not resolve any queueable songs",
+            ));
+        }
+
+        let should_autoplay = self.state.playback.state == PlaybackStatus::Stopped
+            && self.state.playback.current_queue_item_id.is_none()
+            && self.state.queue.is_empty();
+        let start_index = self.state.queue.len();
+        let items = songs
+            .into_iter()
+            .map(|song| self.new_queue_item(song))
+            .collect::<Vec<_>>();
+        self.state.queue.extend(items);
+
+        if should_autoplay {
+            self.start_track(start_index, 0)
+        } else {
+            self.publish_state_updated()
+        }
+    }
+
+    fn new_queue_item(&mut self, song: Song) -> QueueItem {
+        QueueItem {
+            id: self.ids.next_id(IdKind::QueueItem),
+            song,
+            added_at: self.clock.now(),
+            status: QueueItemStatus::Queued,
+        }
     }
 
     pub fn remove_queue_item(&mut self, queue_item_id: &str) -> Result<CommandReceipt, CoreError> {
@@ -1308,13 +1352,16 @@ mod tests {
             .unwrap();
         let job_id = accepted.job_id.unwrap();
 
-        let receipt = orchestrator
-            .complete_youtube_import(&job_id, song("youtube:tuyZ9f6mHZk"))
+        let completion = orchestrator
+            .complete_youtube_import(&job_id, vec![song("youtube:tuyZ9f6mHZk")], 1, 0)
             .unwrap();
 
-        assert!(receipt.queue_item_id.is_some());
+        assert_eq!(completion.queued_count, 1);
+        assert_eq!(completion.failed_count, 0);
         assert_eq!(orchestrator.queue().len(), 1);
         assert_eq!(orchestrator.queue()[0].song.id, "youtube:tuyZ9f6mHZk");
+        assert_eq!(orchestrator.youtube_import_jobs()[0].total_count, 1);
+        assert_eq!(orchestrator.youtube_import_jobs()[0].queued_count, 1);
     }
 
     #[test]
@@ -1393,7 +1440,7 @@ mod tests {
             .unwrap();
 
         let error = orchestrator
-            .complete_youtube_import(&job_id, song("youtube:tuyZ9f6mHZk"))
+            .complete_youtube_import(&job_id, vec![song("youtube:tuyZ9f6mHZk")], 1, 0)
             .unwrap_err();
 
         match error {
@@ -1406,6 +1453,33 @@ mod tests {
             orchestrator.youtube_import_jobs()[0].status,
             YoutubeImportJobStatus::Running
         );
+    }
+
+    #[test]
+    fn youtube_import_completion_rejects_unknown_job_without_mutating_queue() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        let error = orchestrator
+            .complete_youtube_import("youtube_import_job_missing", vec![song("youtube:tuyZ9f6mHZk")], 1, 0)
+            .unwrap_err();
+
+        match error {
+            CoreError::NotFound { kind, id } => {
+                assert_eq!(kind, "youtube_import_job");
+                assert_eq!(id, "youtube_import_job_missing");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        assert!(orchestrator.queue().is_empty());
+        assert!(orchestrator.state().playback().current_queue_item_id.is_none());
+        assert_eq!(orchestrator.events.published.len(), 0);
     }
 
     #[test]
