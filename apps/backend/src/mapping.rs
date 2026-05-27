@@ -81,7 +81,7 @@ pub(crate) fn map_state_snapshot(snapshot: CoreSnapshot) -> StateSnapshot {
     }
 }
 
-pub(crate) fn map_event_envelope(core: CoreEventEnvelope<CoreEvent>) -> EventEnvelope<Value> {
+fn map_event_envelope(core: CoreEventEnvelope<CoreEvent>) -> EventEnvelope<Value> {
     let CoreEventEnvelope {
         event_id,
         event: _,
@@ -93,7 +93,7 @@ pub(crate) fn map_event_envelope(core: CoreEventEnvelope<CoreEvent>) -> EventEnv
     EventEnvelope::new(event_id, event_name, timestamp, server_event)
 }
 
-pub(crate) fn map_server_event(core: CoreEvent) -> (EventName, Value) {
+fn map_server_event(core: CoreEvent) -> (EventName, Value) {
     match core {
         CoreEvent::StateUpdated(event) => (
             EventName::StateUpdated,
@@ -178,7 +178,7 @@ pub(crate) fn map_search_job_summary(job: SearchJobRecord) -> SearchJobSummary {
     }
 }
 
-pub(crate) fn map_search_job_status(status: CoreSearchJobStatus) -> ApiSearchJobStatus {
+fn map_search_job_status(status: CoreSearchJobStatus) -> ApiSearchJobStatus {
     match status {
         CoreSearchJobStatus::Queued => ApiSearchJobStatus::Queued,
         CoreSearchJobStatus::Running => ApiSearchJobStatus::Running,
@@ -187,7 +187,7 @@ pub(crate) fn map_search_job_status(status: CoreSearchJobStatus) -> ApiSearchJob
     }
 }
 
-pub(crate) fn map_youtube_import_job_summary(job: YoutubeImportJobRecord) -> YoutubeImportJobSummary {
+fn map_youtube_import_job_summary(job: YoutubeImportJobRecord) -> YoutubeImportJobSummary {
     YoutubeImportJobSummary {
         job_id: job.job_id,
         status: map_youtube_import_job_status(job.status),
@@ -219,7 +219,7 @@ pub(crate) fn map_youtube_import_request_error(
     )
 }
 
-pub(crate) fn map_youtube_import_job_status(
+fn map_youtube_import_job_status(
     status: CoreYoutubeImportJobStatus,
 ) -> ApiYoutubeImportJobStatus {
     match status {
@@ -229,7 +229,7 @@ pub(crate) fn map_youtube_import_job_status(
     }
 }
 
-pub(crate) fn map_system_error_severity(
+fn map_system_error_severity(
     severity: CoreSystemErrorSeverity,
 ) -> SystemErrorSeverity {
     match severity {
@@ -375,7 +375,8 @@ mod tests {
         CoreEvent, CoreEventEnvelope, SystemErrorEvent, SystemErrorSeverity as CoreSeverity,
     };
 
-    use crate::mapping::{map_core_error, map_event_envelope};
+    use super::map_event_envelope;
+    use crate::mapping::map_core_error;
     use crate::test_support::problem_detail_instance;
 
     #[test]
