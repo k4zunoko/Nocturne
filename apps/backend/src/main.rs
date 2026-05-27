@@ -3,13 +3,12 @@ use std::convert::Infallible;
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_stream::stream;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json as ExtractJson, Path, State};
-use axum::http::StatusCode;
 use axum::http::HeaderMap;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
@@ -26,9 +25,9 @@ use nocturne_core::{
 use nocturne_domain::AudioSettings;
 use nocturne_infrastructure::{
     BroadcastEventPublisher, InfrastructureProfile, LocalAudioSettingsStore, LocalClock,
-    LocalEventLog, LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter,
-    LocalSearchRuntime, LocalYtDlpManager, LocalYtDlpSettingsStore, PlaybackWorkerEvent,
-    SharedPlaybackState, YoutubeImportResolution, canonicalize_supported_youtube_url,
+    LocalEventLog, LocalIdGenerator, LocalPlaybackAdapter, LocalSearchAdapter, LocalSearchRuntime,
+    LocalYtDlpManager, LocalYtDlpSettingsStore, SharedPlaybackState,
+    canonicalize_supported_youtube_url,
 };
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -36,6 +35,9 @@ use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 
 mod mapping;
+#[cfg(test)]
+mod test_support;
+mod workers;
 
 use crate::mapping::{
     command_accepted_response, map_core_error, map_cursor_error, map_json_rejection,
@@ -43,12 +45,9 @@ use crate::mapping::{
     state_headers,
 };
 
-#[cfg(test)]
-mod test_support {
-    pub(crate) fn problem_detail_instance(path: &str) -> &str {
-        path
-    }
-}
+use crate::workers::{
+    spawn_playback_event_bridge, spawn_search_worker, spawn_yt_dlp_update_worker,
+};
 
 type BackendOrchestrator = Orchestrator<
     LocalClock,
@@ -134,430 +133,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn spawn_yt_dlp_update_worker(
-    orchestrator: Arc<Mutex<BackendOrchestrator>>,
-    yt_dlp_manager: LocalYtDlpManager,
-) {
-    tokio::spawn(async move {
-        if let Err(error) = yt_dlp_manager.check_for_updates_if_due().await {
-            eprintln!("failed to check for yt-dlp updates: {error}");
-            return;
-        }
-
-        match yt_dlp_manager.apply_pending_update() {
-            Ok(true) => {
-                let version = yt_dlp_manager.current_version();
-                let mut orchestrator = orchestrator.lock().await;
-                if let Err(error) = orchestrator.update_yt_dlp_version(version) {
-                    eprintln!("failed to publish yt-dlp version update: {error}");
-                }
-            }
-            Ok(false) => {}
-            Err(error) => {
-                eprintln!("failed to promote yt-dlp update: {error}");
-            }
-        }
-    });
-}
-
-fn spawn_search_worker(
-    orchestrator: Arc<Mutex<BackendOrchestrator>>,
-    search_runtime: LocalSearchRuntime,
-) {
-    tokio::spawn(async move {
-        loop {
-            let processed = process_pending_search_jobs(&orchestrator, &search_runtime).await
-                + process_pending_youtube_import_jobs(&orchestrator, &search_runtime).await;
-            let delay = if processed == 0 {
-                Duration::from_millis(100)
-            } else {
-                Duration::from_millis(10)
-            };
-            tokio::time::sleep(delay).await;
-        }
-    });
-}
-
-fn spawn_playback_event_bridge(
-    orchestrator: Arc<Mutex<BackendOrchestrator>>,
-    mut playback_events: mpsc::UnboundedReceiver<PlaybackWorkerEvent>,
-) {
-    tokio::spawn(async move {
-        loop {
-            match playback_events.recv().await {
-                Some(PlaybackWorkerEvent::Started {
-                    playback_session_id,
-                    queue_item_id,
-                    position_ms,
-                }) => {
-                    let mut orchestrator = orchestrator.lock().await;
-                    match orchestrator.confirm_playback_started(
-                        &playback_session_id,
-                        &queue_item_id,
-                        position_ms,
-                    ) {
-                        Ok(true) => {}
-                        Ok(false) => {}
-                        Err(error) => {
-                            eprintln!(
-                                "failed to confirm playback start for {}: {error}",
-                                queue_item_id
-                            );
-                        }
-                    }
-                }
-                Some(PlaybackWorkerEvent::StartFailed {
-                    playback_session_id,
-                    queue_item_id,
-                    code,
-                    message,
-                }) => {
-                    let mut orchestrator = orchestrator.lock().await;
-                    match orchestrator
-                        .report_playback_start_failed(&playback_session_id, &queue_item_id)
-                    {
-                        Ok(true) => {
-                            if let Err(error) = orchestrator.emit_system_error(
-                                code.clone(),
-                                user_message_for_playback_failure(&code),
-                                CoreSystemErrorSeverity::Error,
-                            ) {
-                                eprintln!(
-                                    "failed to emit async playback start error for {}: {error}",
-                                    queue_item_id
-                                );
-                            } else {
-                                eprintln!(
-                                    "playback start failed for {}: {}",
-                                    queue_item_id, message
-                                );
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            eprintln!(
-                                "failed to mark playback start failure for {}: {error}",
-                                queue_item_id
-                            );
-                        }
-                    }
-                }
-                Some(PlaybackWorkerEvent::Interrupted {
-                    playback_session_id,
-                    queue_item_id,
-                    code,
-                    message,
-                }) => {
-                    let mut orchestrator = orchestrator.lock().await;
-                    if orchestrator.state().playback().playback_session_id.as_deref()
-                        != Some(playback_session_id.as_str())
-                    {
-                        continue;
-                    }
-
-                    if let Err(error) = orchestrator.stop() {
-                        eprintln!(
-                            "failed to stop interrupted playback for {}: {error}",
-                            queue_item_id
-                        );
-                    }
-
-                    if let Err(error) = orchestrator.emit_system_error(
-                        code.clone(),
-                        user_message_for_playback_interruption(&code),
-                        CoreSystemErrorSeverity::Error,
-                    ) {
-                        eprintln!(
-                            "failed to emit interrupted playback error for {}: {error}",
-                            queue_item_id
-                        );
-                    } else {
-                        eprintln!(
-                            "playback interrupted for {}: {}",
-                            queue_item_id, message
-                        );
-                    }
-                }
-                Some(PlaybackWorkerEvent::Progress {
-                    playback_session_id,
-                    position_ms,
-                    paused,
-                }) => {
-                    if paused {
-                        continue;
-                    }
-                    let mut orchestrator = orchestrator.lock().await;
-                    if let Err(error) =
-                        orchestrator.report_playback_progress(&playback_session_id, position_ms)
-                    {
-                        eprintln!(
-                            "failed to publish playback progress {} for session {}: {error}",
-                            position_ms, playback_session_id
-                        );
-                    }
-                }
-                Some(PlaybackWorkerEvent::Ended {
-                    playback_session_id,
-                    queue_item_id,
-                    position_ms,
-                }) => {
-                    let mut orchestrator = orchestrator.lock().await;
-                    if let Err(error) =
-                        orchestrator.finish_current_track(&playback_session_id, position_ms)
-                    {
-                        eprintln!(
-                            "failed to advance playback after natural track end {}: {error}",
-                            queue_item_id
-                        );
-                    }
-                }
-                None => break,
-            }
-        }
-    });
-}
-
-async fn process_pending_search_jobs(
-    orchestrator: &Arc<Mutex<BackendOrchestrator>>,
-    search_runtime: &LocalSearchRuntime,
-) -> usize {
-    let pending_jobs = search_runtime.drain_pending();
-
-    for job in &pending_jobs {
-        let runtime = search_runtime.clone();
-        let query = job.query.clone();
-        let result = tokio::task::spawn_blocking(move || runtime.resolve(&query)).await;
-
-        let mut orchestrator = orchestrator.lock().await;
-        match result {
-            Ok(Ok(results)) => {
-                if let Err(error) = orchestrator.complete_search(&job.job_id, results) {
-                    eprintln!("failed to complete search job {}: {error}", job.job_id);
-                }
-            }
-            Ok(Err(failure)) => {
-                let user_message = user_message_for_search_failure(&failure.code);
-                let should_emit_system_error = matches!(
-                    failure.code.as_str(),
-                    "yt_dlp_missing" | "yt_dlp_spawn_failed" | "yt_dlp_timeout"
-                );
-
-                if let Err(error) =
-                    orchestrator.fail_search(&job.job_id, &failure.code, user_message)
-                {
-                    eprintln!("failed to fail search job {}: {error}", job.job_id);
-                }
-
-                if should_emit_system_error
-                    && let Err(error) = orchestrator.emit_system_error(
-                        &failure.code,
-                        user_message,
-                        CoreSystemErrorSeverity::Error,
-                    )
-                {
-                    eprintln!("failed to emit system error for {}: {error}", job.job_id);
-                }
-            }
-            Err(error) => {
-                if let Err(report_error) = orchestrator.fail_search(
-                    &job.job_id,
-                    "search_worker_join_failed",
-                    error.to_string(),
-                ) {
-                    eprintln!(
-                        "failed to report search worker join error for {}: {report_error}",
-                        job.job_id
-                    );
-                }
-            }
-        }
-    }
-
-    pending_jobs.len()
-}
-
-async fn process_pending_youtube_import_jobs(
-    orchestrator: &Arc<Mutex<BackendOrchestrator>>,
-    search_runtime: &LocalSearchRuntime,
-) -> usize {
-    let pending_jobs = search_runtime.drain_pending_youtube_imports();
-
-    for job in &pending_jobs {
-        let runtime = search_runtime.clone();
-        let url = job.url.clone();
-        let result = tokio::task::spawn_blocking(move || runtime.resolve_youtube_url(&url)).await;
-
-        let mut orchestrator = orchestrator.lock().await;
-        match result {
-            Ok(Ok(YoutubeImportResolution {
-                songs,
-                total_count,
-                failed_count,
-                ..
-            })) => {
-                if let Err(error) =
-                    orchestrator.complete_youtube_import(&job.job_id, songs, total_count, failed_count)
-                {
-                    let code = core_error_code(&error).to_owned();
-                    let user_message = user_message_for_youtube_import_completion_error(&error);
-                    let should_emit_system_error = matches!(
-                        code.as_str(),
-                        "yt_dlp_missing"
-                            | "yt_dlp_spawn_failed"
-                            | "yt_dlp_timeout"
-                            | "audio_output_unavailable"
-                            | "audio_source_resolve_failed"
-                            | "playback_stream_open_failed"
-                            | "playback_decode_failed"
-                            | "playback_worker_unavailable"
-                    );
-
-                    if let Err(report_error) =
-                        orchestrator.fail_youtube_import(&job.job_id, &code, user_message)
-                    {
-                        eprintln!(
-                            "failed to convert youtube import completion error for {}: {report_error}",
-                            job.job_id
-                        );
-                    }
-
-                    if should_emit_system_error
-                        && let Err(report_error) = orchestrator.emit_system_error(
-                            &code,
-                            user_message,
-                            CoreSystemErrorSeverity::Error,
-                        )
-                    {
-                        eprintln!(
-                            "failed to emit system error for youtube import {}: {report_error}",
-                            job.job_id
-                        );
-                    }
-                }
-            }
-            Ok(Err(failure)) => {
-                let user_message = user_message_for_youtube_import_failure(&failure.code);
-                let should_emit_system_error = matches!(
-                    failure.code.as_str(),
-                    "yt_dlp_missing" | "yt_dlp_spawn_failed" | "yt_dlp_timeout"
-                );
-
-                if let Err(error) =
-                    orchestrator.fail_youtube_import(&job.job_id, &failure.code, user_message)
-                {
-                    eprintln!("failed to fail youtube import job {}: {error}", job.job_id);
-                }
-
-                if should_emit_system_error
-                    && let Err(error) = orchestrator.emit_system_error(
-                        &failure.code,
-                        user_message,
-                        CoreSystemErrorSeverity::Error,
-                    )
-                {
-                    eprintln!(
-                        "failed to emit system error for youtube import {}: {error}",
-                        job.job_id
-                    );
-                }
-            }
-            Err(error) => {
-                if let Err(report_error) = orchestrator.fail_youtube_import(
-                    &job.job_id,
-                    "youtube_import_worker_join_failed",
-                    error.to_string(),
-                ) {
-                    eprintln!(
-                        "failed to report youtube import join error for {}: {report_error}",
-                        job.job_id
-                    );
-                }
-            }
-        }
-    }
-
-    pending_jobs.len()
-}
-
-fn user_message_for_search_failure(code: &str) -> &'static str {
-    match code {
-        "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
-        "yt_dlp_spawn_failed" => "The backend could not start the search provider.",
-        "yt_dlp_timeout" => "The search provider timed out.",
-        "yt_dlp_invalid_json" | "yt_dlp_invalid_response" => {
-            "The search provider returned unreadable results."
-        }
-        "yt_dlp_failed" => "Search provider failed to return results.",
-        _ => "Search failed on the backend.",
-    }
-}
-
-fn user_message_for_youtube_import_failure(code: &str) -> &'static str {
-    match code {
-        "youtube_url_invalid" => "Input is not a valid YouTube URL.",
-        "youtube_url_unsupported" => "This YouTube URL format is not supported yet.",
-        "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
-        "yt_dlp_spawn_failed" => "The backend could not start YouTube URL resolution.",
-        "yt_dlp_timeout" => "YouTube URL resolution timed out.",
-        "yt_dlp_invalid_json" | "yt_dlp_invalid_response" => {
-            "The backend could not read metadata for this YouTube URL."
-        }
-        "yt_dlp_failed" => "The backend failed to resolve this YouTube URL.",
-        "youtube_import_empty" => {
-            "The backend did not find any playable videos for this YouTube URL."
-        }
-        _ => "YouTube URL import failed on the backend.",
-    }
-}
-
-fn user_message_for_youtube_import_completion_error(error: &CoreError) -> &'static str {
-    match error {
-        CoreError::Port { code, .. } => user_message_for_playback_failure(code),
-        CoreError::Validation { code, .. } | CoreError::Conflict { code, .. } => {
-            user_message_for_youtube_import_failure(code)
-        }
-        CoreError::NotFound { .. } => "YouTube URL import failed on the backend.",
-    }
-}
-
-fn core_error_code(error: &CoreError) -> &str {
-    match error {
-        CoreError::Validation { code, .. } | CoreError::Conflict { code, .. } => code,
-        CoreError::Port { code, .. } => code,
-        CoreError::NotFound { kind, .. } => kind,
-    }
-}
-
-fn user_message_for_playback_failure(code: &str) -> &'static str {
-    match code {
-        "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
-        "yt_dlp_spawn_failed" => "The backend could not start yt-dlp for playback.",
-        "yt_dlp_timeout" => "The backend timed out while preparing audio playback.",
-        "audio_output_unavailable" => "Audio output is unavailable on the backend.",
-        "audio_source_resolve_failed"
-        | "playback_stream_open_failed"
-        | "playback_decode_failed" => "The backend could not load audio for playback.",
-        "playback_seek_failed" => "The backend could not seek the current playback stream.",
-        "playback_url_invalid" | "playback_runtime_failed" => {
-            "The backend could not prepare playback."
-        }
-        "playback_worker_unavailable" => "The backend playback worker is unavailable.",
-        _ => "Playback failed on the backend.",
-    }
-}
-
-fn user_message_for_playback_interruption(code: &str) -> &'static str {
-    match code {
-        "audio_output_changed" => {
-            "Audio output changed. Playback stopped, and the next play will use the current default device."
-        }
-        "audio_output_stream_lost" => {
-            "Playback stopped because the backend lost its audio output stream. Try playing again."
-        }
-        _ => "Playback stopped because audio output became unavailable on the backend.",
-    }
-}
-
 fn report_playback_command_error(orchestrator: &mut BackendOrchestrator, error: &CoreError) {
     let CoreError::Port { code, .. } = error else {
         return;
@@ -565,7 +140,7 @@ fn report_playback_command_error(orchestrator: &mut BackendOrchestrator, error: 
 
     if let Err(report_error) = orchestrator.emit_system_error(
         code.clone(),
-        user_message_for_playback_failure(code),
+        crate::workers::user_message_for_playback_failure(code),
         CoreSystemErrorSeverity::Error,
     ) {
         eprintln!("failed to emit playback system error for {code}: {report_error}");
@@ -1007,7 +582,7 @@ fn validate_bind_addr(addr: SocketAddr) -> Result<SocketAddr, Box<dyn std::error
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -1016,61 +591,21 @@ mod tests {
         QueueRemoveRequest, QueueResponse, StateSnapshot, YoutubeImportRequest,
     };
     use nocturne_core::{
-        CoreEvent, CoreEventEnvelope, CoreEventKind, EventPublisherPort,
-        SearchJobStatus as CoreSearchJobStatus, SystemErrorEvent,
+        CoreEvent, CoreEventEnvelope, CoreEventKind, EventPublisherPort, SystemErrorEvent,
         SystemErrorSeverity as CoreSeverity,
     };
     use nocturne_domain::Song;
+    use nocturne_infrastructure::PlaybackWorkerEvent;
     use tower::ServiceExt;
 
     use crate::mapping::CURRENT_EVENT_ID_HEADER;
-
-    static TEST_SETTINGS_STORE_ID: AtomicU64 = AtomicU64::new(0);
-
-    fn test_playback_adapter() -> LocalPlaybackAdapter {
-        let (event_tx, _) = mpsc::unbounded_channel();
-        LocalPlaybackAdapter::new(SharedPlaybackState::default(), event_tx)
-    }
-
-    fn current_session_id(orchestrator: &BackendOrchestrator) -> String {
-        orchestrator
-            .state()
-            .playback()
-            .playback_session_id
-            .clone()
-            .expect("expected playback session id")
-    }
-
-    fn test_settings_store() -> Arc<Mutex<LocalAudioSettingsStore>> {
-        let store_id = TEST_SETTINGS_STORE_ID.fetch_add(1, Ordering::Relaxed);
-        Arc::new(Mutex::new(LocalAudioSettingsStore::from_path(
-            std::env::temp_dir().join(format!(
-                "nocturne-test-audio-settings-{}-{store_id}.json",
-                std::process::id()
-            )),
-        )))
-    }
-
-    fn test_state() -> AppState {
-        let event_log = LocalEventLog::default();
-        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
-        let mut orchestrator = Orchestrator::new(
-            LocalClock::new(),
-            LocalIdGenerator::new(),
-            event_publisher.clone(),
-            test_playback_adapter(),
-            LocalSearchAdapter::new(LocalSearchRuntime::default()),
-        );
-        orchestrator
-            .hydrate_audio_settings(AudioSettings::default())
-            .unwrap();
-
-        AppState {
-            orchestrator: Arc::new(Mutex::new(orchestrator)),
-            events: event_publisher,
-            settings_store: test_settings_store(),
-        }
-    }
+    use crate::test_support::{
+        current_session_id, test_playback_adapter, test_settings_store, test_state,
+    };
+    use crate::workers::{
+        process_pending_search_jobs, process_pending_youtube_import_jobs,
+        spawn_playback_event_bridge,
+    };
 
     #[tokio::test]
     async fn health_endpoint_returns_ready_status() {
@@ -1241,96 +776,6 @@ mod tests {
         let payload: ProblemDetails = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload.status, StatusCode::CONFLICT.as_u16());
         assert!(payload.detail.contains("Refresh state"));
-    }
-
-    #[tokio::test]
-    async fn pending_search_jobs_are_completed_by_worker_helper() {
-        let event_log = LocalEventLog::default();
-        let event_publisher = BroadcastEventPublisher::new(event_log, 8);
-        let search_runtime = LocalSearchRuntime::default();
-        search_runtime.set_fixture(
-            "worker fixture",
-            vec![Song {
-                id: String::from("youtube:test-song"),
-                title: String::from("Worker Fixture Song"),
-                channel_name: String::from("Fixture Channel"),
-                duration_ms: 123_000,
-                source_url: String::from("https://www.youtube.com/watch?v=test-song"),
-            }],
-        );
-
-        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
-            LocalClock::new(),
-            LocalIdGenerator::new(),
-            event_publisher,
-            test_playback_adapter(),
-            LocalSearchAdapter::new(search_runtime.clone()),
-        )));
-
-        let job_id = {
-            let mut locked = orchestrator.lock().await;
-            locked
-                .submit_search("worker fixture")
-                .unwrap()
-                .job_id
-                .unwrap()
-        };
-
-        let processed = process_pending_search_jobs(&orchestrator, &search_runtime).await;
-        assert_eq!(processed, 1);
-
-        let locked = orchestrator.lock().await;
-        let results = locked.search_results(&job_id).unwrap();
-        assert_eq!(results.job.status, CoreSearchJobStatus::Completed);
-        assert_eq!(results.results.len(), 1);
-        assert_eq!(results.results[0].title, "Worker Fixture Song");
-    }
-
-    #[tokio::test]
-    async fn pending_youtube_import_jobs_are_completed_by_worker_helper() {
-        let event_log = LocalEventLog::default();
-        let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 8);
-        let search_runtime = LocalSearchRuntime::default();
-        search_runtime.set_fixture(
-            "https://www.youtube.com/watch?v=tuyZ9f6mHZk",
-            vec![Song {
-                id: String::from("youtube:tuyZ9f6mHZk"),
-                title: String::from("traveling"),
-                channel_name: String::from("Hikaru Utada"),
-                duration_ms: 295_000,
-                source_url: String::from("https://www.youtube.com/watch?v=tuyZ9f6mHZk"),
-            }],
-        );
-
-        let orchestrator = Arc::new(Mutex::new(Orchestrator::new(
-            LocalClock::new(),
-            LocalIdGenerator::new(),
-            event_publisher,
-            test_playback_adapter(),
-            LocalSearchAdapter::new(search_runtime.clone()),
-        )));
-
-        {
-            let mut locked = orchestrator.lock().await;
-            locked
-                .submit_youtube_import("https://www.youtube.com/watch?v=tuyZ9f6mHZk")
-                .unwrap();
-        }
-
-        let processed = process_pending_youtube_import_jobs(&orchestrator, &search_runtime).await;
-        assert_eq!(processed, 1);
-
-        let locked = orchestrator.lock().await;
-        assert_eq!(locked.queue().len(), 1);
-        assert_eq!(locked.queue()[0].song.id, "youtube:tuyZ9f6mHZk");
-        drop(locked);
-
-        let snapshot = event_log.snapshot();
-        assert!(
-            snapshot
-                .iter()
-                .any(|event| event.event == "youtube.import.completed")
-        );
     }
 
     #[tokio::test]
@@ -1657,7 +1102,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let locked = orchestrator.lock().await;
-        assert_eq!(locked.state().playback().state, nocturne_domain::PlaybackStatus::Stopped);
+        assert_eq!(
+            locked.state().playback().state,
+            nocturne_domain::PlaybackStatus::Stopped
+        );
         assert!(locked.state().playback().current_queue_item_id.is_none());
         drop(locked);
 
