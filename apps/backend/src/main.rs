@@ -65,8 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         events: event_publisher.clone(),
         settings_store,
     });
+    let (queue_len, search_jobs_len) = {
+        let mut orchestrator = orchestrator.lock().await;
+        let snapshot = orchestrator.snapshot();
+        (snapshot.queue.len(), snapshot.search_jobs.len())
+    };
 
-    serve_backend(core, app, event_log, orchestrator).await
+    serve_backend(core, app, event_log, queue_len, search_jobs_len).await
 }
 
 async fn load_initial_audio_settings(
@@ -111,30 +116,38 @@ async fn serve_backend(
     core: NocturneCore,
     app: Router,
     event_log: LocalEventLog,
-    orchestrator: Arc<Mutex<BackendOrchestrator>>,
+    queue_len: usize,
+    search_jobs_len: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bind_addr = validate_bind_addr(backend_bind_addr()?)?;
     let listener = TcpListener::bind(bind_addr).await?;
     let local_addr = listener.local_addr()?;
-    let (queue_len, search_jobs_len) = {
-        let mut orchestrator = orchestrator.lock().await;
-        let snapshot = orchestrator.snapshot();
-        (snapshot.queue.len(), snapshot.search_jobs.len())
-    };
-
     println!(
+        "{}",
+        format_startup_banner(&core, local_addr, queue_len, search_jobs_len, event_log.len())
+    );
+
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn format_startup_banner(
+    core: &NocturneCore,
+    local_addr: SocketAddr,
+    queue_len: usize,
+    search_jobs_len: usize,
+    event_count: usize,
+) -> String {
+    format!(
         "Nocturne backend ready (api {}, profile {}, infra {}, queue {}, search_jobs {}, events {}, listening http://{})",
         ApiVersion::V1,
         core.workspace_profile(),
         InfrastructureProfile::Local,
         queue_len,
         search_jobs_len,
-        event_log.len(),
+        event_count,
         local_addr,
-    );
-
-    axum::serve(listener, app).await?;
-    Ok(())
+    )
 }
 
 fn backend_bind_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
@@ -180,6 +193,26 @@ mod tests {
 
         let loopback_addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         assert_eq!(validate_bind_addr(loopback_addr).unwrap(), loopback_addr);
+    }
+
+    #[test]
+    fn format_startup_banner_reports_current_backend_metrics() {
+        let core = NocturneCore::new();
+        let local_addr: SocketAddr = "127.0.0.1:4100".parse().unwrap();
+
+        assert_eq!(
+            format_startup_banner(&core, local_addr, 2, 3, 5),
+            format!(
+                "Nocturne backend ready (api {}, profile {}, infra {}, queue {}, search_jobs {}, events {}, listening http://{})",
+                ApiVersion::V1,
+                core.workspace_profile(),
+                InfrastructureProfile::Local,
+                2,
+                3,
+                5,
+                local_addr,
+            )
+        );
     }
 
     #[tokio::test]
