@@ -394,6 +394,8 @@ mod tests {
         assert_eq!(envelope.event_id, "evt_0001");
         assert_eq!(envelope.event, EventName::SystemError.to_string());
         assert_eq!(envelope.data["code"], "test_error");
+        assert_eq!(envelope.data["severity"], "error");
+        assert!(envelope.data.get("event").is_none());
     }
 
     #[test]
