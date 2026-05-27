@@ -1,7 +1,7 @@
+use axum::Json;
 use axum::extract::rejection::JsonRejection;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::Event;
-use axum::Json;
 use nocturne_api::{
     BackendStatus, CommandAccepted, EventEnvelope, EventName, PlaybackProgress, ProblemDetails,
     SearchJobCompleted, SearchJobFailed, SearchJobStatus as ApiSearchJobStatus, SearchJobSummary,
@@ -219,9 +219,7 @@ pub(crate) fn map_youtube_import_request_error(
     )
 }
 
-fn map_youtube_import_job_status(
-    status: CoreYoutubeImportJobStatus,
-) -> ApiYoutubeImportJobStatus {
+fn map_youtube_import_job_status(status: CoreYoutubeImportJobStatus) -> ApiYoutubeImportJobStatus {
     match status {
         CoreYoutubeImportJobStatus::Running => ApiYoutubeImportJobStatus::Running,
         CoreYoutubeImportJobStatus::Completed => ApiYoutubeImportJobStatus::Completed,
@@ -229,9 +227,7 @@ fn map_youtube_import_job_status(
     }
 }
 
-fn map_system_error_severity(
-    severity: CoreSystemErrorSeverity,
-) -> SystemErrorSeverity {
+fn map_system_error_severity(severity: CoreSystemErrorSeverity) -> SystemErrorSeverity {
     match severity {
         CoreSystemErrorSeverity::Warning => SystemErrorSeverity::Warning,
         CoreSystemErrorSeverity::Error => SystemErrorSeverity::Error,
@@ -256,7 +252,10 @@ pub(crate) fn map_cursor_error(error: EventCursorError) -> (StatusCode, Json<Pro
     }
 }
 
-pub(crate) fn map_core_error(error: CoreError, instance: &str) -> (StatusCode, Json<ProblemDetails>) {
+pub(crate) fn map_core_error(
+    error: CoreError,
+    instance: &str,
+) -> (StatusCode, Json<ProblemDetails>) {
     match error {
         CoreError::Validation { code, message } => (
             StatusCode::UNPROCESSABLE_ENTITY,
