@@ -389,8 +389,9 @@ where
         }
 
         let queue_len_before = self.state.queue.len();
-        let queued_count = u64::try_from(songs.len())
-            .map_err(|_| CoreError::conflict("queue_item_count_overflow", "queue item count exceeds u64"))?;
+        let queued_count = u64::try_from(songs.len()).map_err(|_| {
+            CoreError::conflict("queue_item_count_overflow", "queue item count exceeds u64")
+        })?;
         match self.enqueue_songs(songs) {
             Ok(()) => {}
             Err(error) => {
@@ -422,9 +423,7 @@ where
 
         self.publish(
             CoreEventKind::YoutubeImportCompleted,
-            CoreEvent::YoutubeImportCompleted(YoutubeImportCompletedEvent {
-                job,
-            }),
+            CoreEvent::YoutubeImportCompleted(YoutubeImportCompletedEvent { job }),
         )?;
 
         Ok(YoutubeImportCompletion {
@@ -1466,7 +1465,12 @@ mod tests {
         );
 
         let error = orchestrator
-            .complete_youtube_import("youtube_import_job_missing", vec![song("youtube:tuyZ9f6mHZk")], 1, 0)
+            .complete_youtube_import(
+                "youtube_import_job_missing",
+                vec![song("youtube:tuyZ9f6mHZk")],
+                1,
+                0,
+            )
             .unwrap_err();
 
         match error {
@@ -1478,7 +1482,13 @@ mod tests {
         }
 
         assert!(orchestrator.queue().is_empty());
-        assert!(orchestrator.state().playback().current_queue_item_id.is_none());
+        assert!(
+            orchestrator
+                .state()
+                .playback()
+                .current_queue_item_id
+                .is_none()
+        );
         assert_eq!(orchestrator.events.published.len(), 0);
     }
 

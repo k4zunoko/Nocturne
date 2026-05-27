@@ -85,7 +85,9 @@ enum AudioOutputSignal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlaybackRecoveryTrigger {
-    StreamError { message: String },
+    StreamError {
+        message: String,
+    },
     DefaultDeviceChanged {
         previous_device_name: Option<String>,
         current_device_name: Option<String>,
@@ -343,12 +345,7 @@ fn playback_worker_loop(
                     &mut last_output_device_name,
                     &mut last_output_device_check_at,
                 ) {
-                    interrupt_active_playback(
-                        &state,
-                        &mut active,
-                        &event_tx,
-                        trigger,
-                    );
+                    interrupt_active_playback(&state, &mut active, &event_tx, trigger);
                     last_output_device_name = current_active_output_device_name(&active);
                     last_output_device_check_at = Instant::now();
                 }
@@ -856,7 +853,10 @@ fn detect_playback_recovery_trigger(
 
     *last_output_device_check_at = Instant::now();
     let current_device_name = current_default_output_device_name();
-    if default_output_device_changed(last_output_device_name.as_deref(), current_device_name.as_deref()) {
+    if default_output_device_changed(
+        last_output_device_name.as_deref(),
+        current_device_name.as_deref(),
+    ) {
         let trigger = PlaybackRecoveryTrigger::DefaultDeviceChanged {
             previous_device_name: last_output_device_name.clone(),
             current_device_name: current_device_name.clone(),
@@ -1472,7 +1472,10 @@ mod tests {
 
     #[test]
     fn default_output_device_change_detection_requires_actual_change() {
-        assert!(!default_output_device_changed(Some("Speakers"), Some("Speakers")));
+        assert!(!default_output_device_changed(
+            Some("Speakers"),
+            Some("Speakers")
+        ));
         assert!(default_output_device_changed(
             Some("Speakers"),
             Some("Headphones")

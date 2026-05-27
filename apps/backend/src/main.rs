@@ -124,7 +124,13 @@ async fn serve_backend(
     let local_addr = listener.local_addr()?;
     println!(
         "{}",
-        format_startup_banner(&core, local_addr, queue_len, search_jobs_len, event_log.len())
+        format_startup_banner(
+            &core,
+            local_addr,
+            queue_len,
+            search_jobs_len,
+            event_log.len()
+        )
     );
 
     axum::serve(listener, app).await?;
