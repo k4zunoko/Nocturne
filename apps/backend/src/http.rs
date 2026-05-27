@@ -19,12 +19,13 @@ use nocturne_core::SystemErrorSeverity as CoreSystemErrorSeverity;
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 
+use crate::BackendOrchestrator;
 use crate::mapping::{
     command_accepted_response, map_core_error, map_cursor_error, map_json_rejection,
     map_search_job_summary, map_sse_event, map_state_snapshot, map_youtube_import_request_error,
     state_headers,
 };
-use crate::{BackendOrchestrator, report_playback_command_error};
+use crate::playback_errors::report_playback_command_error;
 
 #[derive(Clone)]
 pub(crate) struct AppState {

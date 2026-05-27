@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::BackendOrchestrator;
+use crate::playback_errors::user_message_for_playback_failure;
 
 pub(crate) fn spawn_yt_dlp_update_worker(
     orchestrator: Arc<Mutex<BackendOrchestrator>>,
@@ -408,24 +409,6 @@ pub(crate) fn core_error_code(error: &CoreError) -> &str {
     }
 }
 
-pub(crate) fn user_message_for_playback_failure(code: &str) -> &'static str {
-    match code {
-        "yt_dlp_missing" => "yt-dlp is not installed for this backend.",
-        "yt_dlp_spawn_failed" => "The backend could not start yt-dlp for playback.",
-        "yt_dlp_timeout" => "The backend timed out while preparing audio playback.",
-        "audio_output_unavailable" => "Audio output is unavailable on the backend.",
-        "audio_source_resolve_failed"
-        | "playback_stream_open_failed"
-        | "playback_decode_failed" => "The backend could not load audio for playback.",
-        "playback_seek_failed" => "The backend could not seek the current playback stream.",
-        "playback_url_invalid" | "playback_runtime_failed" => {
-            "The backend could not prepare playback."
-        }
-        "playback_worker_unavailable" => "The backend playback worker is unavailable.",
-        _ => "Playback failed on the backend.",
-    }
-}
-
 pub(crate) fn user_message_for_playback_interruption(code: &str) -> &'static str {
     match code {
         "audio_output_changed" => {
@@ -455,7 +438,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::BackendOrchestrator;
-    use crate::report_playback_command_error;
+    use crate::playback_errors::report_playback_command_error;
     use crate::test_support::{
         current_session_id, test_playback_adapter, test_search_runtime_with_fixture,
     };

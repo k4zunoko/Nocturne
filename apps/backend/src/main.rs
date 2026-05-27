@@ -3,9 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use nocturne_api::ApiVersion;
-use nocturne_core::{
-    CoreError, NocturneCore, Orchestrator, SystemErrorSeverity as CoreSystemErrorSeverity,
-};
+use nocturne_core::{NocturneCore, Orchestrator};
 use nocturne_domain::AudioSettings;
 use nocturne_infrastructure::{
     BroadcastEventPublisher, InfrastructureProfile, LocalAudioSettingsStore, LocalClock,
@@ -18,6 +16,7 @@ use tokio::sync::mpsc;
 
 mod http;
 mod mapping;
+mod playback_errors;
 #[cfg(test)]
 mod test_support;
 mod workers;
@@ -102,20 +101,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-fn report_playback_command_error(orchestrator: &mut BackendOrchestrator, error: &CoreError) {
-    let CoreError::Port { code, .. } = error else {
-        return;
-    };
-
-    if let Err(report_error) = orchestrator.emit_system_error(
-        code.clone(),
-        crate::workers::user_message_for_playback_failure(code),
-        CoreSystemErrorSeverity::Error,
-    ) {
-        eprintln!("failed to emit playback system error for {code}: {report_error}");
-    }
 }
 
 fn backend_bind_addr() -> Result<SocketAddr, Box<dyn std::error::Error>> {
