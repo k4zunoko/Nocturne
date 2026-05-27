@@ -13,6 +13,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use crate::BackendOrchestrator;
+use crate::http::AppState;
 
 static TEST_SETTINGS_STORE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -35,7 +36,7 @@ pub(crate) fn test_settings_store() -> Arc<Mutex<LocalAudioSettingsStore>> {
     )))
 }
 
-pub(crate) fn test_state() -> crate::http::AppState {
+pub(crate) fn test_state() -> AppState {
     let event_log = LocalEventLog::default();
     let event_publisher = BroadcastEventPublisher::new(event_log, 8);
     let mut orchestrator = Orchestrator::new(
@@ -49,7 +50,7 @@ pub(crate) fn test_state() -> crate::http::AppState {
         .hydrate_audio_settings(AudioSettings::default())
         .unwrap();
 
-    crate::http::AppState {
+    AppState {
         orchestrator: Arc::new(Mutex::new(orchestrator)),
         events: event_publisher,
         settings_store: test_settings_store(),
@@ -107,9 +108,10 @@ pub(crate) fn test_search_runtime_with_fixture(
 #[cfg(test)]
 mod tests {
     use super::test_state;
+    use crate::http::AppState;
 
     #[test]
     fn test_state_returns_http_app_state() {
-        let _: crate::http::AppState = test_state();
+        let _: AppState = test_state();
     }
 }
