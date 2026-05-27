@@ -2592,10 +2592,7 @@ mod tests {
             Some(String::from("evt_1")),
         );
 
-        assert_eq!(
-            app.status_message,
-            "Input is not a valid YouTube URL."
-        );
+        assert_eq!(app.status_message, "Input is not a valid YouTube URL.");
         assert!(app.pending_youtube_import_job_id.is_none());
     }
 }

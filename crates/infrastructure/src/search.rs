@@ -134,7 +134,10 @@ impl LocalSearchRuntime {
         search_with_yt_dlp(query, &yt_dlp)
     }
 
-    pub fn resolve_youtube_url(&self, url: &str) -> Result<YoutubeImportResolution, LocalSearchFailure> {
+    pub fn resolve_youtube_url(
+        &self,
+        url: &str,
+    ) -> Result<YoutubeImportResolution, LocalSearchFailure> {
         let url = url.trim();
         let normalized_url = normalize_query(url);
         let yt_dlp = {
@@ -506,9 +509,7 @@ fn parse_supported_youtube_url(url: &str) -> Result<ResolvedYoutubeVideoUrl, Loc
         });
     };
 
-    Ok(ResolvedYoutubeVideoUrl {
-        canonical_url,
-    })
+    Ok(ResolvedYoutubeVideoUrl { canonical_url })
 }
 
 fn canonical_youtube_watch_url(video_id: &str) -> String {
@@ -640,11 +641,9 @@ mod tests {
             "duration": 295.0
         }"#;
 
-        let result = parse_yt_dlp_youtube_output(
-            payload,
-            "https://www.youtube.com/watch?v=tuyZ9f6mHZk",
-        )
-        .unwrap();
+        let result =
+            parse_yt_dlp_youtube_output(payload, "https://www.youtube.com/watch?v=tuyZ9f6mHZk")
+                .unwrap();
 
         assert_eq!(result.songs[0].id, "youtube:tuyZ9f6mHZk");
         assert_eq!(result.songs[0].channel_name, "Hikaru Utada");
