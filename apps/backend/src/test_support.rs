@@ -35,7 +35,7 @@ pub(crate) fn test_settings_store() -> Arc<Mutex<LocalAudioSettingsStore>> {
     )))
 }
 
-pub(crate) fn test_state() -> crate::AppState {
+pub(crate) fn test_state() -> crate::http::AppState {
     let event_log = LocalEventLog::default();
     let event_publisher = BroadcastEventPublisher::new(event_log, 8);
     let mut orchestrator = Orchestrator::new(
@@ -49,7 +49,7 @@ pub(crate) fn test_state() -> crate::AppState {
         .hydrate_audio_settings(AudioSettings::default())
         .unwrap();
 
-    crate::AppState {
+    crate::http::AppState {
         orchestrator: Arc::new(Mutex::new(orchestrator)),
         events: event_publisher,
         settings_store: test_settings_store(),
@@ -102,4 +102,14 @@ pub(crate) fn test_search_runtime_with_fixture(
         search_runtime,
         Arc::new(Mutex::new(orchestrator)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_state;
+
+    #[test]
+    fn test_state_returns_http_app_state() {
+        let _: crate::http::AppState = test_state();
+    }
 }

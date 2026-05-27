@@ -58,10 +58,14 @@ type BackendOrchestrator = Orchestrator<
 >;
 
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     orchestrator: Arc<Mutex<BackendOrchestrator>>,
     events: BroadcastEventPublisher,
     settings_store: Arc<Mutex<LocalAudioSettingsStore>>,
+}
+
+pub(crate) mod http {
+    pub(crate) use super::AppState;
 }
 
 #[tokio::main]
