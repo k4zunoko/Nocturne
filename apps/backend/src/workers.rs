@@ -441,18 +441,28 @@ pub(crate) fn user_message_for_playback_interruption(code: &str) -> &'static str
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
-    use nocturne_core::SearchJobStatus as CoreSearchJobStatus;
-    use nocturne_domain::Song;
+    use nocturne_core::{
+        CoreEvent, SearchJobStatus as CoreSearchJobStatus, SystemErrorSeverity as CoreSeverity,
+    };
+    use nocturne_domain::{AudioSettings, PlaybackStatus, Song};
     use nocturne_infrastructure::{
         BroadcastEventPublisher, LocalClock, LocalEventLog, LocalIdGenerator, LocalSearchAdapter,
-        LocalSearchRuntime,
+        LocalSearchRuntime, PlaybackWorkerEvent,
     };
     use tokio::sync::Mutex;
+    use tokio::sync::mpsc;
 
     use crate::BackendOrchestrator;
-    use crate::test_support::{test_playback_adapter, test_search_runtime_with_fixture};
-    use crate::workers::{process_pending_search_jobs, process_pending_youtube_import_jobs};
+    use crate::report_playback_command_error;
+    use crate::test_support::{
+        current_session_id, test_playback_adapter, test_search_runtime_with_fixture,
+    };
+    use crate::workers::{
+        process_pending_search_jobs, process_pending_youtube_import_jobs,
+        spawn_playback_event_bridge,
+    };
 
     #[tokio::test]
     async fn pending_search_jobs_are_completed_by_worker_helper() {
@@ -524,5 +534,202 @@ mod tests {
                 .iter()
                 .any(|event| event.event == "youtube.import.completed")
         );
+    }
+
+    #[tokio::test]
+    async fn worker_emits_system_error_for_missing_yt_dlp() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 8);
+        let search_runtime = LocalSearchRuntime::default();
+        search_runtime.set_failure(
+            "missing provider",
+            "yt_dlp_missing",
+            "hidden internal detail",
+        );
+        let orchestrator = Arc::new(Mutex::new(BackendOrchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher.clone(),
+            test_playback_adapter(),
+            LocalSearchAdapter::new(search_runtime.clone()),
+        )));
+
+        {
+            let mut locked = orchestrator.lock().await;
+            locked.submit_search("missing provider").unwrap();
+        }
+        process_pending_search_jobs(&orchestrator, &search_runtime).await;
+
+        let snapshot = event_log.snapshot();
+        let has_system_error = snapshot
+            .iter()
+            .any(|event| matches!(event.data, CoreEvent::SystemError(_)));
+        assert!(has_system_error);
+    }
+
+    #[test]
+    fn playback_port_errors_emit_user_visible_system_errors() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 8);
+        let mut orchestrator = BackendOrchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher,
+            test_playback_adapter(),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+
+        report_playback_command_error(
+            &mut orchestrator,
+            &nocturne_core::CoreError::Port {
+                code: String::from("audio_output_unavailable"),
+                message: String::from("hidden detail"),
+            },
+        );
+
+        let snapshot = event_log.snapshot();
+        let system_error = snapshot
+            .iter()
+            .find_map(|event| match &event.data {
+                CoreEvent::SystemError(system_error) => Some(system_error),
+                _ => None,
+            })
+            .expect("expected a system.error event");
+
+        assert_eq!(system_error.code, "audio_output_unavailable");
+        assert_eq!(
+            system_error.message,
+            "Audio output is unavailable on the backend."
+        );
+        assert_eq!(system_error.severity, CoreSeverity::Error);
+    }
+
+    #[tokio::test]
+    async fn interrupted_playback_event_stops_playback_and_emits_system_error() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 8);
+        let mut orchestrator = BackendOrchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher,
+            test_playback_adapter(),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+        orchestrator
+            .hydrate_audio_settings(AudioSettings::default())
+            .unwrap();
+
+        let receipt = orchestrator
+            .enqueue_song(Song {
+                id: String::from("youtube:interrupted-song"),
+                title: String::from("Interrupted Song"),
+                channel_name: String::from("Fixture Channel"),
+                duration_ms: 123_000,
+                source_url: String::from("https://example.com/interrupted-song"),
+            })
+            .unwrap();
+        let queue_item_id = receipt.queue_item_id.expect("expected queued item id");
+        let playback_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&playback_session_id, &queue_item_id, 321)
+            .unwrap();
+
+        let orchestrator = Arc::new(Mutex::new(orchestrator));
+        let (playback_event_tx, playback_event_rx) = mpsc::unbounded_channel();
+        spawn_playback_event_bridge(orchestrator.clone(), playback_event_rx);
+
+        playback_event_tx
+            .send(PlaybackWorkerEvent::Interrupted {
+                playback_session_id,
+                queue_item_id,
+                code: String::from("audio_output_changed"),
+                message: String::from("recovery failed after device loss"),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let locked = orchestrator.lock().await;
+        assert_eq!(locked.state().playback().state, PlaybackStatus::Stopped);
+        assert!(locked.state().playback().current_queue_item_id.is_none());
+        drop(locked);
+
+        let snapshot = event_log.snapshot();
+        let system_error = snapshot
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                CoreEvent::SystemError(system_error) => Some(system_error),
+                _ => None,
+            })
+            .expect("expected a system.error event");
+
+        assert_eq!(system_error.code, "audio_output_changed");
+        assert_eq!(
+            system_error.message,
+            "Audio output changed. Playback stopped, and the next play will use the current default device."
+        );
+        assert_eq!(system_error.severity, CoreSeverity::Error);
+    }
+
+    #[tokio::test]
+    async fn interrupted_stream_error_emits_generic_audio_output_message() {
+        let event_log = LocalEventLog::default();
+        let event_publisher = BroadcastEventPublisher::new(event_log.clone(), 8);
+        let mut orchestrator = BackendOrchestrator::new(
+            LocalClock::new(),
+            LocalIdGenerator::new(),
+            event_publisher,
+            test_playback_adapter(),
+            LocalSearchAdapter::new(LocalSearchRuntime::default()),
+        );
+        orchestrator
+            .hydrate_audio_settings(AudioSettings::default())
+            .unwrap();
+
+        let receipt = orchestrator
+            .enqueue_song(Song {
+                id: String::from("youtube:interrupted-stream-song"),
+                title: String::from("Interrupted Stream Song"),
+                channel_name: String::from("Fixture Channel"),
+                duration_ms: 123_000,
+                source_url: String::from("https://example.com/interrupted-stream-song"),
+            })
+            .unwrap();
+        let queue_item_id = receipt.queue_item_id.expect("expected queued item id");
+        let playback_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&playback_session_id, &queue_item_id, 321)
+            .unwrap();
+
+        let orchestrator = Arc::new(Mutex::new(orchestrator));
+        let (playback_event_tx, playback_event_rx) = mpsc::unbounded_channel();
+        spawn_playback_event_bridge(orchestrator.clone(), playback_event_rx);
+
+        playback_event_tx
+            .send(PlaybackWorkerEvent::Interrupted {
+                playback_session_id,
+                queue_item_id,
+                code: String::from("audio_output_stream_lost"),
+                message: String::from("stream error: device disappeared"),
+            })
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let snapshot = event_log.snapshot();
+        let system_error = snapshot
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                CoreEvent::SystemError(system_error) => Some(system_error),
+                _ => None,
+            })
+            .expect("expected a system.error event");
+
+        assert_eq!(system_error.code, "audio_output_stream_lost");
+        assert_eq!(
+            system_error.message,
+            "Playback stopped because the backend lost its audio output stream. Try playing again."
+        );
+        assert_eq!(system_error.severity, CoreSeverity::Error);
     }
 }
