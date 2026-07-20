@@ -467,7 +467,10 @@ fn parse_supported_youtube_url(url: &str) -> Result<ResolvedYoutubeVideoUrl, Loc
                 message: String::from("Input is not a valid YouTube URL."),
             });
         }
-        canonical_youtube_watch_url(video_id)
+        match resolvable_playlist_id(&parsed) {
+            Some(playlist_id) => canonical_youtube_playlist_url(&playlist_id),
+            None => canonical_youtube_watch_url(video_id),
+        }
     } else if matches!(host.as_str(), "youtube.com" | "www.youtube.com") {
         if parsed.path() == "/playlist" {
             let playlist_id = parsed
@@ -478,7 +481,7 @@ fn parse_supported_youtube_url(url: &str) -> Result<ResolvedYoutubeVideoUrl, Loc
                     code: String::from("youtube_url_invalid"),
                     message: String::from("Input is not a valid YouTube URL."),
                 })?;
-            format!("https://{YOUTUBE_CANONICAL_HOST}/playlist?list={playlist_id}")
+            canonical_youtube_playlist_url(&playlist_id)
         } else {
             if parsed.path() != YOUTUBE_WATCH_PATH {
                 return Err(LocalSearchFailure {
@@ -500,7 +503,10 @@ fn parse_supported_youtube_url(url: &str) -> Result<ResolvedYoutubeVideoUrl, Loc
                     message: String::from("Input is not a valid YouTube URL."),
                 });
             }
-            canonical_youtube_watch_url(&video)
+            match resolvable_playlist_id(&parsed) {
+                Some(playlist_id) => canonical_youtube_playlist_url(&playlist_id),
+                None => canonical_youtube_watch_url(&video),
+            }
         }
     } else {
         return Err(LocalSearchFailure {
@@ -514,6 +520,29 @@ fn parse_supported_youtube_url(url: &str) -> Result<ResolvedYoutubeVideoUrl, Loc
 
 fn canonical_youtube_watch_url(video_id: &str) -> String {
     format!("https://{YOUTUBE_CANONICAL_HOST}{YOUTUBE_WATCH_PATH}?v={video_id}")
+}
+
+fn canonical_youtube_playlist_url(playlist_id: &str) -> String {
+    format!("https://{YOUTUBE_CANONICAL_HOST}/playlist?list={playlist_id}")
+}
+
+/// Returns the `list` playlist id from a watch/short URL when it identifies a
+/// fixed, resolvable playlist (e.g. user playlists `PL...` or auto-generated
+/// album releases `OLAK5...`). Radio/mix lists (`RD...`) are per-video,
+/// effectively unbounded auto-mixes, and personal lists (`WL`/`LL`/`LM`)
+/// require authentication, so those fall back to the single video instead.
+fn resolvable_playlist_id(parsed: &reqwest::Url) -> Option<String> {
+    let list = parsed
+        .query_pairs()
+        .find_map(|(key, value)| (key == "list").then_some(value.into_owned()))
+        .filter(|value| !value.is_empty())?;
+
+    let upper = list.to_ascii_uppercase();
+    if upper.starts_with("RD") || matches!(upper.as_str(), "WL" | "LL" | "LM") {
+        return None;
+    }
+
+    Some(list)
 }
 
 fn valid_video_id(value: &str) -> bool {
@@ -674,7 +703,25 @@ mod tests {
             parse_supported_youtube_url("https://youtu.be/tuyZ9f6mHZk?list=PL1234567890")
                 .unwrap()
                 .canonical_url,
+            "https://www.youtube.com/playlist?list=PL1234567890"
+        );
+        assert_eq!(
+            parse_supported_youtube_url("https://youtu.be/tuyZ9f6mHZk?list=RD1234567890")
+                .unwrap()
+                .canonical_url,
             "https://www.youtube.com/watch?v=tuyZ9f6mHZk"
+        );
+    }
+
+    #[test]
+    fn watch_url_with_release_playlist_resolves_whole_playlist() {
+        assert_eq!(
+            parse_supported_youtube_url(
+                "https://www.youtube.com/watch?v=8aLKD0bMK-k&list=OLAK5uy_n55sywtidjFKm_ppuuvm68AtArHWXFupM",
+            )
+            .unwrap()
+            .canonical_url,
+            "https://www.youtube.com/playlist?list=OLAK5uy_n55sywtidjFKm_ppuuvm68AtArHWXFupM"
         );
     }
 
@@ -683,6 +730,15 @@ mod tests {
         assert_eq!(
             parse_supported_youtube_url(
                 "https://www.youtube.com/watch?v=tuyZ9f6mHZk&list=PL1234567890",
+            )
+            .unwrap()
+            .canonical_url,
+            "https://www.youtube.com/playlist?list=PL1234567890"
+        );
+
+        assert_eq!(
+            parse_supported_youtube_url(
+                "https://www.youtube.com/watch?v=tuyZ9f6mHZk&list=RD1234567890",
             )
             .unwrap()
             .canonical_url,

@@ -39,7 +39,7 @@ async fn youtube_import_endpoint_canonicalizes_short_urls_before_job_submission(
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::to_vec(&YoutubeImportRequest {
-                        url: String::from("https://youtu.be/tuyZ9f6mHZk?list=PL1234567890"),
+                        url: String::from("https://youtu.be/tuyZ9f6mHZk?list=RD1234567890"),
                     })
                     .unwrap(),
                 ))
