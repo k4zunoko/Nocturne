@@ -450,7 +450,7 @@ impl App {
 
         self.render_now_playing_widget(frame, layout[0]);
         frame.render_widget(self.search_input_widget(), layout[1]);
-        frame.render_widget(self.queue_summary_widget(), layout[2]);
+        frame.render_widget(self.queue_summary_widget(layout[2]), layout[2]);
         frame.render_widget(self.status_widget(), layout[3]);
         frame.render_widget(self.shortcuts_widget(), layout[4]);
 
@@ -1341,19 +1341,30 @@ impl App {
             .wrap(Wrap { trim: true })
     }
 
-    fn queue_summary_widget(&self) -> Paragraph<'static> {
+    fn queue_summary_widget(&self, area: Rect) -> Paragraph<'static> {
         let mut lines = Vec::new();
         if self.queue.is_empty() {
             lines.push(Line::from("Queue is empty."));
         } else {
-            for item in self.queue.iter().take(8) {
-                lines.push(Line::from(self.format_queue_row(item, false)));
-            }
-            if self.queue.len() > 8 {
-                lines.push(Line::from(format!(
-                    "… and {} more items. Open Queue with Ctrl+Q.",
-                    self.queue.len() - 8
-                )));
+            // Reserve two rows for the block's top and bottom borders.
+            let inner_height = area.height.saturating_sub(2) as usize;
+            let total = self.queue.len();
+            if inner_height > 0 {
+                if total <= inner_height {
+                    for item in self.queue.iter() {
+                        lines.push(Line::from(self.format_queue_row(item, false)));
+                    }
+                } else {
+                    // Keep the last row for the overflow notice.
+                    let visible = inner_height.saturating_sub(1);
+                    for item in self.queue.iter().take(visible) {
+                        lines.push(Line::from(self.format_queue_row(item, false)));
+                    }
+                    lines.push(Line::from(format!(
+                        "… and {} more items. Open Queue with Ctrl+Q.",
+                        total - visible
+                    )));
+                }
             }
         }
 
