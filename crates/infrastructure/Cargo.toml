@@ -10,7 +10,8 @@ serde.workspace = true
 serde_json.workspace = true
 nocturne-core = { path = "../core" }
 nocturne-domain = { path = "../domain" }
-rodio = { version = "0.22.2", default-features = false, features = ["playback", "symphonia-all"] }
+kira = { version = "0.12.2", default-features = false, features = ["cpal", "mp3", "ogg", "vorbis", "flac", "wav", "pcm", "isomp4", "aac"] }
+symphonia = { version = "0.6", default-features = false }
 stream-download = { version = "0.24", features = ["process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 sha2 = "0.10"

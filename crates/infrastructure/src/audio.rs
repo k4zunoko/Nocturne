@@ -1,14 +1,16 @@
 use std::collections::HashMap;
-use std::io::BufReader;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use kira::sound::streaming::{StreamingSoundData, StreamingSoundHandle};
+use kira::sound::{FromFileError, PlaybackState};
+use kira::{AudioManager, AudioManagerSettings, DefaultBackend, Decibels, Tween};
 use nocturne_core::{PlaybackPort, PortError};
 use nocturne_domain::{AudioSettings, QueueItem};
-use rodio::cpal::traits::{DeviceTrait, HostTrait};
-use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player};
+use symphonia::core::io::MediaSource;
 use stream_download::process::{ProcessStreamParams, YtDlpCommand};
 use stream_download::storage::temp::TempStorageProvider;
 use stream_download::{Settings, StreamDownload};
@@ -21,7 +23,6 @@ use crate::yt_dlp::LocalYtDlpManager;
 const YT_DLP_AUDIO_FORMAT: &str = "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best";
 const YT_DLP_PROCESS_AUDIO_FORMAT: &str = "140/139";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_millis(250);
-const OUTPUT_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const PLAYBACK_URL_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const PLAYBACK_URL_CACHE_LIMIT: usize = 64;
 const PLAYBACK_STREAM_PREFETCH_BYTES: u64 = 64 * 1024;
@@ -72,25 +73,6 @@ pub enum PlaybackWorkerEvent {
         queue_item_id: String,
         code: String,
         message: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum AudioOutputSignal {
-    StreamError {
-        playback_session_id: String,
-        message: String,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PlaybackRecoveryTrigger {
-    StreamError {
-        message: String,
-    },
-    DefaultDeviceChanged {
-        previous_device_name: Option<String>,
-        current_device_name: Option<String>,
     },
 }
 
@@ -264,11 +246,10 @@ enum ActivePlayback {
         duration_ms: u64,
         paused: bool,
     },
-    Rodio {
+    Kira {
         playback_session_id: String,
         queue_item_id: String,
-        _sink: MixerDeviceSink,
-        player: Player,
+        handle: StreamingSoundHandle<FromFileError>,
     },
 }
 
@@ -285,12 +266,10 @@ fn playback_worker_loop(
     yt_dlp: LocalYtDlpManager,
 ) {
     let mut active = None;
+    let mut manager: Option<AudioManager<DefaultBackend>> = None;
     let mut playback_runtime = None;
     let mut resolved_playback_urls = HashMap::new();
     let mut volume_percent = AudioSettings::DEFAULT_VOLUME_PERCENT;
-    let (audio_output_signal_tx, audio_output_signal_rx) = mpsc::channel();
-    let mut last_output_device_name = None;
-    let mut last_output_device_check_at = Instant::now();
 
     loop {
         match receiver.recv_timeout(WORKER_POLL_INTERVAL) {
@@ -302,6 +281,7 @@ fn playback_worker_loop(
                 handle_start(
                     &state,
                     &mut active,
+                    &mut manager,
                     &mut playback_runtime,
                     &mut resolved_playback_urls,
                     &yt_dlp,
@@ -310,17 +290,14 @@ fn playback_worker_loop(
                     playback_session_id,
                     position_ms,
                     volume_percent,
-                    &audio_output_signal_tx,
                 );
-                last_output_device_name = current_active_output_device_name(&active);
-                last_output_device_check_at = Instant::now();
             }
             Ok(WorkerCommand::SetVolume {
                 volume_percent: next_volume_percent,
                 reply,
             }) => {
                 volume_percent = next_volume_percent;
-                let _ = reply.send(handle_set_volume(&state, &active, volume_percent));
+                let _ = reply.send(handle_set_volume(&state, &mut active, volume_percent));
             }
             Ok(WorkerCommand::Pause { reply }) => {
                 let _ = reply.send(handle_pause(&state, &mut active));
@@ -338,20 +315,7 @@ fn playback_worker_loop(
                 clear_active_playback(&state, &mut active, false);
                 break;
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if let Some(trigger) = detect_playback_recovery_trigger(
-                    &active,
-                    &audio_output_signal_rx,
-                    &mut last_output_device_name,
-                    &mut last_output_device_check_at,
-                ) {
-                    interrupt_active_playback(&state, &mut active, &event_tx, trigger);
-                    last_output_device_name = current_active_output_device_name(&active);
-                    last_output_device_check_at = Instant::now();
-                }
-
-                poll_active_playback(&state, &mut active, &event_tx)
-            }
+            Err(RecvTimeoutError::Timeout) => poll_active_playback(&state, &mut active, &event_tx),
         }
     }
 }
@@ -359,6 +323,7 @@ fn playback_worker_loop(
 fn handle_start(
     state: &SharedPlaybackState,
     active: &mut Option<ActivePlayback>,
+    manager: &mut Option<AudioManager<DefaultBackend>>,
     playback_runtime: &mut Option<Runtime>,
     resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
     yt_dlp: &LocalYtDlpManager,
@@ -367,7 +332,6 @@ fn handle_start(
     playback_session_id: String,
     position_ms: u64,
     volume_percent: u8,
-    audio_output_signal_tx: &Sender<AudioOutputSignal>,
 ) {
     clear_active_playback(state, active, false);
     let load_started_at = Instant::now();
@@ -382,6 +346,7 @@ fn handle_start(
         }
     } else {
         match open_real_playback(
+            manager,
             &item,
             &playback_session_id,
             position_ms,
@@ -389,16 +354,16 @@ fn handle_start(
             resolved_playback_urls,
             yt_dlp,
             volume_percent,
-            audio_output_signal_tx,
         ) {
             Ok(active_playback) => active_playback,
             Err(error) => {
                 eprintln!(
-                    "[nocturne][playback] start failed queue_item_id={} session_id={} elapsed_ms={} code={}",
+                    "[nocturne][playback] start failed queue_item_id={} session_id={} elapsed_ms={} code={} message={}",
                     item.id,
                     playback_session_id,
                     load_started_at.elapsed().as_millis(),
                     error.code(),
+                    error.message(),
                 );
                 let mut snapshot = recover_lock(&state.inner);
                 snapshot.current_item = None;
@@ -463,8 +428,8 @@ fn handle_pause(
                 *paused = true;
             }
         }
-        Some(ActivePlayback::Rodio { player, .. }) => {
-            player.pause();
+        Some(ActivePlayback::Kira { handle, .. }) => {
+            handle.pause(Tween::default());
         }
         None => {}
     }
@@ -477,11 +442,11 @@ fn handle_pause(
 
 fn handle_set_volume(
     state: &SharedPlaybackState,
-    active: &Option<ActivePlayback>,
+    active: &mut Option<ActivePlayback>,
     volume_percent: u8,
 ) -> Result<(), PortError> {
-    if let Some(ActivePlayback::Rodio { player, .. }) = active.as_ref() {
-        player.set_volume(percent_to_gain(volume_percent));
+    if let Some(ActivePlayback::Kira { handle, .. }) = active.as_mut() {
+        handle.set_volume(percent_to_decibels(volume_percent), Tween::default());
     }
 
     let mut snapshot = recover_lock(&state.inner);
@@ -505,8 +470,8 @@ fn handle_resume(
                 *paused = false;
             }
         }
-        Some(ActivePlayback::Rodio { player, .. }) => {
-            player.play();
+        Some(ActivePlayback::Kira { handle, .. }) => {
+            handle.resume(Tween::default());
         }
         None => {}
     }
@@ -540,15 +505,8 @@ fn handle_seek(
             *base_position_ms = position_ms.min(*duration_ms);
             *anchor_at = Instant::now();
         }
-        Some(ActivePlayback::Rodio { player, .. }) => {
-            player
-                .try_seek(Duration::from_millis(position_ms))
-                .map_err(|error| {
-                    PortError::new(
-                        "playback_seek_failed",
-                        format!("failed to seek active playback: {error}"),
-                    )
-                })?;
+        Some(ActivePlayback::Kira { handle, .. }) => {
+            handle.seek_to(position_ms as f64 / 1000.0);
         }
         None => {}
     }
@@ -557,6 +515,18 @@ fn handle_seek(
     snapshot.position_ms = position_ms;
     snapshot.history.push(PlaybackCommand::Seek { position_ms });
     Ok(())
+}
+
+/// Derives the `(paused, finished)` flags for the shared snapshot / worker
+/// events from a Kira playback state. Only a fully `Stopped` sound counts as
+/// finished, so a seek/restart (which keeps the sound Playing/Paused) is never
+/// mistaken for a natural end.
+fn derive_playback_flags(state: PlaybackState) -> (bool, bool) {
+    match state {
+        PlaybackState::Playing => (false, false),
+        PlaybackState::Stopped => (false, true),
+        _ => (true, false),
+    }
 }
 
 fn poll_active_playback(
@@ -595,18 +565,18 @@ fn poll_active_playback(
                 finished,
             )
         }
-        ActivePlayback::Rodio {
+        ActivePlayback::Kira {
             playback_session_id,
             queue_item_id,
-            player,
-            ..
+            handle,
         } => {
-            let finished = player.empty();
+            let (paused, finished) = derive_playback_flags(handle.state());
+            let position_ms = (handle.position() * 1000.0) as u64;
             (
                 playback_session_id.clone(),
                 queue_item_id.clone(),
-                player.get_pos().as_millis() as u64,
-                player.is_paused(),
+                position_ms,
+                paused,
                 finished,
             )
         }
@@ -661,10 +631,8 @@ fn clear_active_playback(
 }
 
 fn drop_active_output(active: &mut Option<ActivePlayback>) {
-    if let Some(active_playback) = active.take()
-        && let ActivePlayback::Rodio { player, .. } = active_playback
-    {
-        player.stop();
+    if let Some(ActivePlayback::Kira { mut handle, .. }) = active.take() {
+        handle.stop(Tween::default());
     }
 }
 
@@ -675,6 +643,7 @@ fn simulated_position_ms(anchor_at: Instant, base_position_ms: u64, duration_ms:
 }
 
 fn open_real_playback(
+    manager: &mut Option<AudioManager<DefaultBackend>>,
     item: &QueueItem,
     playback_session_id: &str,
     position_ms: u64,
@@ -682,307 +651,116 @@ fn open_real_playback(
     resolved_playback_urls: &mut HashMap<String, ResolvedPlaybackUrl>,
     yt_dlp: &LocalYtDlpManager,
     volume_percent: u8,
-    audio_output_signal_tx: &Sender<AudioOutputSignal>,
 ) -> Result<ActivePlayback, PortError> {
-    let audio_output_started_at = Instant::now();
-    let sink = open_default_output_sink(playback_session_id, audio_output_signal_tx)?;
-    let audio_output_elapsed_ms = audio_output_started_at.elapsed().as_millis();
-
-    let player_started_at = Instant::now();
-    let player = Player::connect_new(sink.mixer());
-    let player_elapsed_ms = player_started_at.elapsed().as_millis();
-
-    let runtime_started_at = Instant::now();
+    let load_started_at = Instant::now();
+    let manager = audio_manager_instance(manager)?;
     let runtime = playback_runtime_instance(playback_runtime)?;
-    let runtime_elapsed_ms = runtime_started_at.elapsed().as_millis();
 
-    let (playback_url, reader, resolve_elapsed_ms, stream_open_elapsed_ms) =
-        if is_youtube_url(&item.song.source_url) {
-            let stream_open_started_at = Instant::now();
-            match runtime.block_on(open_youtube_playback_stream(&item.song.source_url, yt_dlp)) {
-                Ok(reader) => (
-                    String::from("https://youtube.local/audio.m4a?mime=audio%2Fmp4"),
-                    reader,
-                    0,
-                    stream_open_started_at.elapsed().as_millis(),
-                ),
-                Err(_) => {
-                    let resolve_started_at = Instant::now();
-                    let playback_url = resolve_playback_url(
-                        &item.song.source_url,
-                        resolved_playback_urls,
-                        yt_dlp,
-                    )?;
-                    let resolve_elapsed_ms = resolve_started_at.elapsed().as_millis();
-                    let stream_open_started_at = Instant::now();
-                    let reader = runtime.block_on(open_http_playback_stream(&playback_url))?;
-                    (
-                        playback_url,
-                        reader,
-                        resolve_elapsed_ms,
-                        stream_open_started_at.elapsed().as_millis(),
-                    )
-                }
+    let reader = if is_youtube_url(&item.song.source_url) {
+        match runtime.block_on(open_youtube_playback_stream(&item.song.source_url, yt_dlp)) {
+            Ok(reader) => reader,
+            Err(_) => {
+                let playback_url =
+                    resolve_playback_url(&item.song.source_url, resolved_playback_urls, yt_dlp)?;
+                runtime.block_on(open_http_playback_stream(&playback_url))?
             }
-        } else {
-            let playback_url =
-                resolve_playback_url(&item.song.source_url, resolved_playback_urls, yt_dlp)?;
-            let stream_open_started_at = Instant::now();
-            let reader = runtime.block_on(open_http_playback_stream(&playback_url))?;
-            (
-                playback_url,
-                reader,
-                0,
-                stream_open_started_at.elapsed().as_millis(),
-            )
-        };
+        }
+    } else {
+        let playback_url =
+            resolve_playback_url(&item.song.source_url, resolved_playback_urls, yt_dlp)?;
+        runtime.block_on(open_http_playback_stream(&playback_url))?
+    };
 
     let byte_len = reader.content_length();
-    let decoder_preferences = infer_decoder_preferences(&playback_url);
-    let decode_started_at = Instant::now();
-    let mut decoder_builder = Decoder::builder().with_data(BufReader::new(reader));
-    if let Some(byte_len) = byte_len {
-        decoder_builder = decoder_builder.with_byte_len(byte_len);
-        decoder_builder = decoder_builder.with_seekable(true);
-    }
-    if let Some(format_hint) = decoder_preferences.format_hint {
-        decoder_builder = decoder_builder.with_hint(format_hint);
-    }
-    if let Some(mime_type) = decoder_preferences.mime_type {
-        decoder_builder = decoder_builder.with_mime_type(mime_type);
-    }
-    let decoder = decoder_builder.build().map_err(|error| {
+    let source = StreamMediaSource {
+        inner: reader,
+        byte_len,
+    };
+
+    let sound_data = StreamingSoundData::from_media_source(source)
+        .map_err(|error| {
+            PortError::new(
+                "playback_decode_failed",
+                format!("failed to decode the playback stream: {error}"),
+            )
+        })?
+        .start_position(position_ms as f64 / 1000.0)
+        .volume(percent_to_decibels(volume_percent));
+
+    let handle = manager.play(sound_data).map_err(|error| {
         PortError::new(
-            "playback_decode_failed",
-            format!("failed to decode the playback stream: {error}"),
+            "playback_start_failed",
+            format!("failed to start playback: {error}"),
         )
     })?;
-    let decode_elapsed_ms = decode_started_at.elapsed().as_millis();
-
-    let append_started_at = Instant::now();
-    player.append(decoder);
-    player.set_volume(percent_to_gain(volume_percent));
-    let append_elapsed_ms = append_started_at.elapsed().as_millis();
-
-    let seek_started_at = Instant::now();
-    if position_ms > 0 {
-        player
-            .try_seek(Duration::from_millis(position_ms))
-            .map_err(|error| {
-                PortError::new(
-                    "playback_seek_failed",
-                    format!("failed to seek the playback stream: {error}"),
-                )
-            })?;
-    }
-    let seek_elapsed_ms = seek_started_at.elapsed().as_millis();
 
     eprintln!(
-        "[nocturne][playback] open_real_playback queue_item_id={} session_id={} output_ms={} player_ms={} resolve_ms={} runtime_ms={} stream_open_ms={} decode_ms={} append_ms={} seek_ms={} total_ms={}",
+        "[nocturne][playback] open_real_playback queue_item_id={} session_id={} total_ms={}",
         item.id,
         playback_session_id,
-        audio_output_elapsed_ms,
-        player_elapsed_ms,
-        resolve_elapsed_ms,
-        runtime_elapsed_ms,
-        stream_open_elapsed_ms,
-        decode_elapsed_ms,
-        append_elapsed_ms,
-        seek_elapsed_ms,
-        audio_output_started_at.elapsed().as_millis(),
+        load_started_at.elapsed().as_millis(),
     );
 
-    Ok(ActivePlayback::Rodio {
+    Ok(ActivePlayback::Kira {
         playback_session_id: playback_session_id.to_owned(),
         queue_item_id: item.id.clone(),
-        _sink: sink,
-        player,
+        handle,
     })
 }
 
-fn open_default_output_sink(
-    playback_session_id: &str,
-    audio_output_signal_tx: &Sender<AudioOutputSignal>,
-) -> Result<MixerDeviceSink, PortError> {
-    let error_signal_tx = audio_output_signal_tx.clone();
-    let playback_session_id = playback_session_id.to_owned();
-    DeviceSinkBuilder::from_default_device()
-        .map_err(|error| {
-            PortError::new(
-                "audio_output_unavailable",
-                format!("failed to open the default audio output device: {error}"),
-            )
-        })?
-        .with_error_callback(move |error| {
-            let _ = error_signal_tx.send(AudioOutputSignal::StreamError {
-                playback_session_id: playback_session_id.clone(),
-                message: error.to_string(),
-            });
-        })
-        .open_stream()
-        .map_err(|error| {
-            PortError::new(
-                "audio_output_unavailable",
-                format!("failed to open the default audio output device: {error}"),
-            )
-        })
+fn audio_manager_instance(
+    manager: &mut Option<AudioManager<DefaultBackend>>,
+) -> Result<&mut AudioManager<DefaultBackend>, PortError> {
+    if manager.is_none() {
+        *manager = Some(
+            AudioManager::<DefaultBackend>::new(AudioManagerSettings::default()).map_err(
+                |error| {
+                    PortError::new(
+                        "audio_output_unavailable",
+                        format!("failed to initialize the audio output: {error}"),
+                    )
+                },
+            )?,
+        );
+    }
+
+    Ok(manager
+        .as_mut()
+        .expect("audio manager should be initialized"))
 }
 
-fn detect_playback_recovery_trigger(
-    active: &Option<ActivePlayback>,
-    audio_output_signal_rx: &Receiver<AudioOutputSignal>,
-    last_output_device_name: &mut Option<String>,
-    last_output_device_check_at: &mut Instant,
-) -> Option<PlaybackRecoveryTrigger> {
-    if !matches!(active, Some(ActivePlayback::Rodio { .. })) {
-        return None;
-    }
-
-    let stream_error = consume_audio_output_signal(
-        audio_output_signal_rx,
-        active_playback_session_id(active.as_ref()),
-    );
-
-    if stream_error.is_some() {
-        return stream_error;
-    }
-
-    if last_output_device_check_at.elapsed() < OUTPUT_DEVICE_POLL_INTERVAL {
-        return None;
-    }
-
-    *last_output_device_check_at = Instant::now();
-    let current_device_name = current_default_output_device_name();
-    if default_output_device_changed(
-        last_output_device_name.as_deref(),
-        current_device_name.as_deref(),
-    ) {
-        let trigger = PlaybackRecoveryTrigger::DefaultDeviceChanged {
-            previous_device_name: last_output_device_name.clone(),
-            current_device_name: current_device_name.clone(),
-        };
-        *last_output_device_name = current_device_name;
-        return Some(trigger);
-    }
-
-    *last_output_device_name = current_device_name;
-    None
+/// Adapts a `stream-download` reader into a symphonia `MediaSource` so Kira can
+/// decode and seek streamed audio without buffering the whole file up front.
+struct StreamMediaSource {
+    inner: StreamDownload<TempStorageProvider>,
+    byte_len: Option<u64>,
 }
 
-fn consume_audio_output_signal(
-    audio_output_signal_rx: &Receiver<AudioOutputSignal>,
-    active_playback_session_id: Option<&str>,
-) -> Option<PlaybackRecoveryTrigger> {
-    let mut stream_error = None;
-
-    while let Ok(signal) = audio_output_signal_rx.try_recv() {
-        match signal {
-            AudioOutputSignal::StreamError {
-                playback_session_id,
-                message,
-            } if Some(playback_session_id.as_str()) == active_playback_session_id => {
-                stream_error = Some(PlaybackRecoveryTrigger::StreamError { message });
-            }
-            AudioOutputSignal::StreamError { .. } => {}
-        }
-    }
-
-    stream_error
-}
-
-fn interrupt_active_playback(
-    state: &SharedPlaybackState,
-    active: &mut Option<ActivePlayback>,
-    event_tx: &UnboundedSender<PlaybackWorkerEvent>,
-    trigger: PlaybackRecoveryTrigger,
-) {
-    let Some((playback_session_id, queue_item_id)) = active_playback_ids(active.as_ref()) else {
-        return;
-    };
-    eprintln!(
-        "[nocturne][playback] interrupted queue_item_id={} session_id={} reason={}",
-        queue_item_id,
-        playback_session_id,
-        playback_recovery_reason(&trigger),
-    );
-    clear_active_playback(state, active, false);
-    let _ = event_tx.send(PlaybackWorkerEvent::Interrupted {
-        playback_session_id,
-        queue_item_id,
-        code: interruption_code(&trigger).to_owned(),
-        message: playback_recovery_reason(&trigger),
-    });
-}
-
-fn interruption_code(trigger: &PlaybackRecoveryTrigger) -> &'static str {
-    match trigger {
-        PlaybackRecoveryTrigger::StreamError { .. } => "audio_output_stream_lost",
-        PlaybackRecoveryTrigger::DefaultDeviceChanged { .. } => "audio_output_changed",
+impl Read for StreamMediaSource {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
     }
 }
 
-fn active_playback_session_id(active: Option<&ActivePlayback>) -> Option<&str> {
-    match active {
-        Some(ActivePlayback::Simulated {
-            playback_session_id,
-            ..
-        })
-        | Some(ActivePlayback::Rodio {
-            playback_session_id,
-            ..
-        }) => Some(playback_session_id.as_str()),
-        None => None,
+impl Seek for StreamMediaSource {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
     }
 }
 
-fn active_playback_ids(active: Option<&ActivePlayback>) -> Option<(String, String)> {
-    match active {
-        Some(ActivePlayback::Rodio {
-            playback_session_id,
-            queue_item_id,
-            ..
-        }) => Some((playback_session_id.clone(), queue_item_id.clone())),
-        _ => None,
+impl MediaSource for StreamMediaSource {
+    fn is_seekable(&self) -> bool {
+        // Only advertise seeking when we know the total length. Some sources
+        // (notably the yt-dlp process stream) have no content length; claiming
+        // seekability there makes symphonia attempt an end-relative seek during
+        // probing, which fails on a length-unknown stream. Matches the previous
+        // rodio decoder, which only enabled seeking when a byte length was known.
+        self.byte_len.is_some()
     }
-}
 
-fn playback_recovery_reason(trigger: &PlaybackRecoveryTrigger) -> String {
-    match trigger {
-        PlaybackRecoveryTrigger::StreamError { message } => {
-            format!("stream error: {message}")
-        }
-        PlaybackRecoveryTrigger::DefaultDeviceChanged {
-            previous_device_name,
-            current_device_name,
-        } => format!(
-            "default output device changed: {} -> {}",
-            previous_device_name.as_deref().unwrap_or("<none>"),
-            current_device_name.as_deref().unwrap_or("<none>")
-        ),
+    fn byte_len(&self) -> Option<u64> {
+        self.byte_len
     }
-}
-
-fn current_active_output_device_name(active: &Option<ActivePlayback>) -> Option<String> {
-    if matches!(active, Some(ActivePlayback::Rodio { .. })) {
-        current_default_output_device_name()
-    } else {
-        None
-    }
-}
-
-fn current_default_output_device_name() -> Option<String> {
-    rodio::cpal::default_host()
-        .default_output_device()
-        .and_then(|device| {
-            device
-                .description()
-                .ok()
-                .map(|description| description.name().to_owned())
-        })
-}
-
-fn default_output_device_changed(previous: Option<&str>, current: Option<&str>) -> bool {
-    previous != current
 }
 
 fn playback_runtime_instance(
@@ -1164,8 +942,13 @@ fn resolve_youtube_playback_url(
     })
 }
 
-fn percent_to_gain(volume_percent: u8) -> f32 {
-    f32::from(volume_percent.min(100)) / 100.0
+fn percent_to_decibels(volume_percent: u8) -> Decibels {
+    let gain = f32::from(volume_percent.min(100)) / 100.0;
+    if gain <= 0.0 {
+        Decibels::SILENCE
+    } else {
+        Decibels(20.0 * gain.log10())
+    }
 }
 
 fn gain_to_percent(gain: f32) -> u8 {
@@ -1188,68 +971,6 @@ fn first_non_empty_line(stdout: &[u8]) -> Option<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(str::to_owned)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DecoderPreferences {
-    format_hint: Option<&'static str>,
-    mime_type: Option<&'static str>,
-}
-
-fn infer_decoder_preferences(playback_url: &str) -> DecoderPreferences {
-    let normalized = playback_url.trim().to_ascii_lowercase();
-
-    if normalized.contains("mime=audio%2fmpeg")
-        || normalized.contains("mime=audio/mpeg")
-        || normalized.contains(".mp3")
-    {
-        return DecoderPreferences {
-            format_hint: Some("mp3"),
-            mime_type: Some("audio/mpeg"),
-        };
-    }
-
-    if normalized.contains("mime=audio%2fogg")
-        || normalized.contains("mime=audio/ogg")
-        || normalized.contains(".ogg")
-    {
-        return DecoderPreferences {
-            format_hint: Some("ogg"),
-            mime_type: Some("audio/ogg"),
-        };
-    }
-
-    if normalized.contains("mime=audio%2fflac")
-        || normalized.contains("mime=audio/flac")
-        || normalized.contains(".flac")
-    {
-        return DecoderPreferences {
-            format_hint: Some("flac"),
-            mime_type: Some("audio/flac"),
-        };
-    }
-
-    if normalized.contains("mime=audio%2fwav")
-        || normalized.contains("mime=audio/wav")
-        || normalized.contains(".wav")
-    {
-        return DecoderPreferences {
-            format_hint: Some("wav"),
-            mime_type: Some("audio/wav"),
-        };
-    }
-
-    if normalized.contains("mime=audio%2fmp4") || normalized.contains("mime=audio/mp4") {
-        return DecoderPreferences {
-            format_hint: None,
-            mime_type: Some("audio/mp4"),
-        };
-    }
-
-    DecoderPreferences {
-        format_hint: None,
-        mime_type: None,
-    }
 }
 
 fn should_simulate_source(source_url: &str) -> bool {
@@ -1408,6 +1129,35 @@ mod tests {
     }
 
     #[test]
+    fn percent_to_decibels_maps_full_and_silence() {
+        assert_eq!(percent_to_decibels(0), Decibels::SILENCE);
+        // 100% is unity gain (0 dB).
+        assert!((percent_to_decibels(100).0 - 0.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn percent_to_decibels_is_monotonic_and_attenuates_below_full() {
+        let quiet = percent_to_decibels(25).0;
+        let mid = percent_to_decibels(50).0;
+        let loud = percent_to_decibels(100).0;
+        assert!(quiet < mid);
+        assert!(mid < loud);
+        // Below 100% attenuates (negative dB).
+        assert!(mid < 0.0);
+    }
+
+    #[test]
+    fn derive_playback_flags_only_treats_stopped_as_finished() {
+        assert_eq!(derive_playback_flags(PlaybackState::Playing), (false, false));
+        assert_eq!(derive_playback_flags(PlaybackState::Paused), (true, false));
+        assert_eq!(
+            derive_playback_flags(PlaybackState::Pausing),
+            (true, false)
+        );
+        assert_eq!(derive_playback_flags(PlaybackState::Stopped), (false, true));
+    }
+
+    #[test]
     fn finished_simulated_sources_clear_shared_snapshot() {
         let shared = SharedPlaybackState::default();
         let (event_tx, _) = tokio::sync::mpsc::unbounded_channel();
@@ -1448,96 +1198,6 @@ mod tests {
         assert_eq!(
             YT_DLP_AUDIO_FORMAT,
             "140/139/bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/bestaudio[ext=mp3]/bestaudio[acodec^=mp3]/best[ext=mp4]/best"
-        );
-    }
-
-    #[test]
-    fn infer_decoder_preferences_recognizes_mp3_streams() {
-        let preferences =
-            infer_decoder_preferences("https://example.com/audio.mp3?mime=audio%2Fmpeg");
-
-        assert_eq!(preferences.format_hint, Some("mp3"));
-        assert_eq!(preferences.mime_type, Some("audio/mpeg"));
-    }
-
-    #[test]
-    fn infer_decoder_preferences_recognizes_mp4_audio_streams() {
-        let preferences = infer_decoder_preferences(
-            "https://example.com/videoplayback?mime=audio%2Fmp4&itag=140",
-        );
-
-        assert_eq!(preferences.format_hint, None);
-        assert_eq!(preferences.mime_type, Some("audio/mp4"));
-    }
-
-    #[test]
-    fn default_output_device_change_detection_requires_actual_change() {
-        assert!(!default_output_device_changed(
-            Some("Speakers"),
-            Some("Speakers")
-        ));
-        assert!(default_output_device_changed(
-            Some("Speakers"),
-            Some("Headphones")
-        ));
-        assert!(default_output_device_changed(Some("Speakers"), None));
-    }
-
-    #[test]
-    fn stale_audio_output_signals_are_ignored_for_new_sessions() {
-        let (signal_tx, signal_rx) = mpsc::channel();
-        signal_tx
-            .send(AudioOutputSignal::StreamError {
-                playback_session_id: String::from("playback_session_old"),
-                message: String::from("stale device error"),
-            })
-            .unwrap();
-
-        let trigger = consume_audio_output_signal(&signal_rx, Some("playback_session_new"));
-
-        assert_eq!(trigger, None);
-    }
-
-    #[test]
-    fn current_session_audio_output_signal_is_consumed() {
-        let (signal_tx, signal_rx) = mpsc::channel();
-        signal_tx
-            .send(AudioOutputSignal::StreamError {
-                playback_session_id: String::from("playback_session_old"),
-                message: String::from("stale device error"),
-            })
-            .unwrap();
-        signal_tx
-            .send(AudioOutputSignal::StreamError {
-                playback_session_id: String::from("playback_session_current"),
-                message: String::from("current device error"),
-            })
-            .unwrap();
-
-        let trigger = consume_audio_output_signal(&signal_rx, Some("playback_session_current"));
-
-        assert_eq!(
-            trigger,
-            Some(PlaybackRecoveryTrigger::StreamError {
-                message: String::from("current device error"),
-            })
-        );
-    }
-
-    #[test]
-    fn interruption_code_reflects_recovery_trigger() {
-        assert_eq!(
-            interruption_code(&PlaybackRecoveryTrigger::StreamError {
-                message: String::from("stream broke"),
-            }),
-            "audio_output_stream_lost"
-        );
-        assert_eq!(
-            interruption_code(&PlaybackRecoveryTrigger::DefaultDeviceChanged {
-                previous_device_name: Some(String::from("Speakers")),
-                current_device_name: Some(String::from("Headphones")),
-            }),
-            "audio_output_changed"
         );
     }
 

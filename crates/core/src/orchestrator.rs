@@ -716,14 +716,21 @@ where
     }
 
     pub fn restart_current(&mut self) -> Result<CommandReceipt, CoreError> {
-        if self.state.queue.is_empty() {
-            return Err(CoreError::conflict(
-                "queue_empty",
-                "cannot skip backward without queued items",
-            ));
-        }
+        // The playback sources (yt-dlp streams) are not seekable, so restarting
+        // cannot rewind the active stream in place. Reload the current track
+        // from the beginning instead. Only meaningful while a track is loaded.
+        let target_index = if matches!(
+            self.state.playback.state,
+            PlaybackStatus::Playing | PlaybackStatus::Paused
+        ) {
+            self.current_index()
+        } else {
+            None
+        };
 
-        let target_index = self.current_index().unwrap_or(0);
+        let target_index = target_index.ok_or_else(|| {
+            CoreError::conflict("no_current_track", "cannot restart without a current track")
+        })?;
 
         self.start_track(target_index, 0)?;
         self.command_accepted(None, None)
@@ -1564,7 +1571,7 @@ mod tests {
     }
 
     #[test]
-    fn restart_current_restarts_current_track_without_history() {
+    fn restart_current_reloads_current_track_from_start_while_playing() {
         let mut orchestrator = Orchestrator::new(
             StubClock,
             StubIds::default(),
@@ -1581,15 +1588,81 @@ mod tests {
         orchestrator.seek(12_345).unwrap();
 
         orchestrator.restart_current().unwrap();
+
+        // Reload: a fresh playback session is minted and a new start is issued
+        // from position 0 for the same queue item.
         let second_session_id = current_session_id(&orchestrator);
+        assert_ne!(second_session_id, first_session_id);
+        assert_eq!(orchestrator.playback.started.len(), 2);
+        assert_eq!(
+            orchestrator.state().playback().state,
+            PlaybackStatus::Loading
+        );
+        assert_eq!(orchestrator.state().playback().position_ms, 0);
+        assert_eq!(orchestrator.queue().len(), 1);
+        assert_eq!(orchestrator.queue()[0].song.id, "song_1");
+
         orchestrator
             .confirm_playback_started(&second_session_id, "queue_item_0001", 0)
             .unwrap();
+        assert_eq!(
+            orchestrator.state().playback().state,
+            PlaybackStatus::Playing
+        );
+    }
 
-        assert_eq!(orchestrator.queue().len(), 1);
-        assert_eq!(orchestrator.queue()[0].song.id, "song_1");
-        assert_eq!(orchestrator.queue()[0].status, QueueItemStatus::Playing);
+    #[test]
+    fn restart_current_reloads_current_track_from_start_while_paused() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        orchestrator.enqueue_song(song("song_1")).unwrap();
+        let first_session_id = current_session_id(&orchestrator);
+        orchestrator
+            .confirm_playback_started(&first_session_id, "queue_item_0001", 0)
+            .unwrap();
+        orchestrator.seek(9_000).unwrap();
+        orchestrator.pause().unwrap();
+
+        orchestrator.restart_current().unwrap();
+
+        let second_session_id = current_session_id(&orchestrator);
+        assert_ne!(second_session_id, first_session_id);
+        assert_eq!(orchestrator.playback.started.len(), 2);
+        assert_eq!(
+            orchestrator.state().playback().state,
+            PlaybackStatus::Loading
+        );
         assert_eq!(orchestrator.state().playback().position_ms, 0);
+    }
+
+    #[test]
+    fn restart_current_is_rejected_when_not_playing_or_paused() {
+        let mut orchestrator = Orchestrator::new(
+            StubClock,
+            StubIds::default(),
+            StubEvents::default(),
+            StubPlayback::default(),
+            StubSearch::default(),
+        );
+
+        let error = orchestrator.restart_current().unwrap_err();
+
+        match error {
+            CoreError::Conflict { code, message } => {
+                assert_eq!(code, "no_current_track");
+                assert_eq!(message, "cannot restart without a current track");
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+
+        // No reload was attempted.
+        assert!(orchestrator.playback.started.is_empty());
     }
 
     #[test]
